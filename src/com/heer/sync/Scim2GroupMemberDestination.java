@@ -65,7 +65,15 @@ import jakarta.ws.rs.core.HttpHeaders;
 import org.glassfish.jersey.client.authentication.HttpAuthenticationFeature;
 import org.glassfish.jersey.apache.connector.ApacheConnectorProvider;
 import org.glassfish.jersey.client.ClientConfig;
+import org.glassfish.jersey.client.ClientProperties;
 import java.io.IOException;
+import java.io.FileInputStream;
+import java.security.KeyStore;
+import java.security.cert.X509Certificate;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.TrustManagerFactory;
+import javax.net.ssl.X509TrustManager;
 
 
 /**
@@ -127,6 +135,19 @@ public class Scim2GroupMemberDestination extends SyncDestination
   private String authType;
   private String bearerToken;
   private String updateMethod;
+
+  // SSL/TLS configuration
+  private String trustStorePath;
+  private String trustStorePassword;
+  private String trustStoreType;
+  private boolean allowUntrustedCertificates;
+
+  // HTTP proxy configuration
+  private String proxyHost;
+  private String proxyPort;
+  private String proxyUsername;
+  private String proxyPassword;
+  private String proxyType;
 
 
   /**
@@ -231,6 +252,65 @@ public class Scim2GroupMemberDestination extends SyncDestination
                                  "by the client, it will automatically fall back to PUT " +
                                  "(default: patch).");
 
+    // SSL/TLS certificate trust configuration
+    StringArgument trustStorePathArg = new StringArgument(
+                                 null, "trust-store-path", false, 1,
+                                 "{path}", 
+                                 "Path to custom truststore file for HTTPS certificate " +
+                                 "validation (e.g., /path/to/truststore.jks). If not specified, " +
+                                 "uses JVM default truststore.");
+
+    StringArgument trustStorePasswordArg = new StringArgument(
+                                 null, "trust-store-password", false, 1,
+                                 "{password}", 
+                                 "Password for the custom truststore file. Required when " +
+                                 "trust-store-path is specified.");
+
+    StringArgument trustStoreTypeArg = new StringArgument(
+                                 null, "trust-store-type", false, 1,
+                                 "{JKS|PKCS12|etc}", 
+                                 "Type of the truststore file (default: JKS). Common types " +
+                                 "include JKS, PKCS12, JCEKS.");
+
+    StringArgument allowUntrustedCertsArg = new StringArgument(
+                                 null, "allow-untrusted-certificates", false, 0,
+                                 null, 
+                                 "Allow connections to HTTPS endpoints with untrusted " +
+                                 "certificates (self-signed, expired, wrong hostname, etc.). " +
+                                 "WARNING: This disables certificate validation and should " +
+                                 "ONLY be used in development/testing environments.");
+
+    // HTTP proxy configuration
+    StringArgument proxyHostArg = new StringArgument(
+                                 null, "proxy-host", false, 1,
+                                 "{hostname}", 
+                                 "HTTP proxy server hostname or IP address. When specified, " +
+                                 "all SCIM2 requests will be routed through this proxy.");
+
+    StringArgument proxyPortArg = new StringArgument(
+                                 null, "proxy-port", false, 1,
+                                 "{port}", 
+                                 "HTTP proxy server port number (e.g., 8080, 3128). " +
+                                 "Required when proxy-host is specified.");
+
+    StringArgument proxyUsernameArg = new StringArgument(
+                                 null, "proxy-username", false, 1,
+                                 "{username}", 
+                                 "Username for proxy authentication (if proxy requires " +
+                                 "authentication).");
+
+    StringArgument proxyPasswordArg = new StringArgument(
+                                 null, "proxy-password", false, 1,
+                                 "{password}", 
+                                 "Password for proxy authentication (required when " +
+                                 "proxy-username is specified).");
+
+    StringArgument proxyTypeArg = new StringArgument(
+                                 null, "proxy-type", false, 1,
+                                 "{HTTP|SOCKS}", 
+                                 "Type of proxy server: 'HTTP' for HTTP/HTTPS proxy or " +
+                                 "'SOCKS' for SOCKS proxy (default: HTTP).");
+
     parser.addArgument(baseUrlArg);
     parser.addArgument(userBaseArg);
     parser.addArgument(groupBaseArg);
@@ -241,6 +321,15 @@ public class Scim2GroupMemberDestination extends SyncDestination
     parser.addArgument(authTypeArg);
     parser.addArgument(bearerTokenArg);
     parser.addArgument(updateMethodArg);
+    parser.addArgument(trustStorePathArg);
+    parser.addArgument(trustStorePasswordArg);
+    parser.addArgument(trustStoreTypeArg);
+    parser.addArgument(allowUntrustedCertsArg);
+    parser.addArgument(proxyHostArg);
+    parser.addArgument(proxyPortArg);
+    parser.addArgument(proxyUsernameArg);
+    parser.addArgument(proxyPasswordArg);
+    parser.addArgument(proxyTypeArg);
   }
 
 
@@ -279,6 +368,41 @@ public class Scim2GroupMemberDestination extends SyncDestination
                     "update-method=put"),
           "Sync group membership changes to SCIM2 endpoint using OAuth Bearer Token authentication, " +
           "monitoring memberOf attribute and using PUT method for updates (metadata stripped per RFC 7643).");
+
+    exampleMap.put(
+      Arrays.asList("base-url=https://internal-scim.company.com/scim/v2", 
+                    "user-base=/Users", "group-base=/Groups",
+                    "username=syncuser", "password=p@ssW0rd",
+                    "group-membership-attributes=memberOf",
+                    "username-lookup-attribute=uid",
+                    "trust-store-path=/opt/certs/company-truststore.jks",
+                    "trust-store-password=trustpass",
+                    "trust-store-type=JKS"),
+          "Sync to internal SCIM2 endpoint using custom truststore for SSL certificate validation, " +
+          "ideal for internal CA or self-signed certificates in enterprise environments.");
+
+    exampleMap.put(
+      Arrays.asList("base-url=https://example.com/scim/v2", 
+                    "user-base=/Users", "group-base=/Groups",
+                    "username=syncuser", "password=p@ssW0rd",
+                    "group-membership-attributes=memberOf,groups",
+                    "username-lookup-attribute=uid",
+                    "proxy-host=proxy.company.com",
+                    "proxy-port=8080",
+                    "proxy-username=proxyuser",
+                    "proxy-password=proxypass"),
+          "Sync through corporate HTTP proxy with authentication, useful for environments " +
+          "where direct internet access is restricted and all traffic must go through a proxy.");
+
+    exampleMap.put(
+      Arrays.asList("base-url=https://dev-scim.example.com/scim/v2", 
+                    "user-base=/Users", "group-base=/Groups",
+                    "username=devuser", "password=devpass",
+                    "group-membership-attributes=memberOf",
+                    "username-lookup-attribute=uid",
+                    "allow-untrusted-certificates"),
+          "Development/testing configuration that accepts untrusted SSL certificates " +
+          "(self-signed, expired, wrong hostname). ⚠️ WARNING: Only use in non-production environments!");
 
     return exampleMap;
   }
@@ -341,6 +465,35 @@ public class Scim2GroupMemberDestination extends SyncDestination
     StringArgument updateMethodArg = (StringArgument)
                               parser.getNamedArgument("update-method");
 
+    // SSL/TLS certificate trust configuration
+    StringArgument trustStorePathArg = (StringArgument)
+                              parser.getNamedArgument("trust-store-path");
+
+    StringArgument trustStorePasswordArg = (StringArgument)
+                              parser.getNamedArgument("trust-store-password");
+
+    StringArgument trustStoreTypeArg = (StringArgument)
+                              parser.getNamedArgument("trust-store-type");
+
+    StringArgument allowUntrustedCertsArg = (StringArgument)
+                              parser.getNamedArgument("allow-untrusted-certificates");
+
+    // HTTP proxy configuration
+    StringArgument proxyHostArg = (StringArgument)
+                              parser.getNamedArgument("proxy-host");
+
+    StringArgument proxyPortArg = (StringArgument)
+                              parser.getNamedArgument("proxy-port");
+
+    StringArgument proxyUsernameArg = (StringArgument)
+                              parser.getNamedArgument("proxy-username");
+
+    StringArgument proxyPasswordArg = (StringArgument)
+                              parser.getNamedArgument("proxy-password");
+
+    StringArgument proxyTypeArg = (StringArgument)
+                              parser.getNamedArgument("proxy-type");
+
     this.baseUrl = baseUrlArg.getValue();
     this.userBasePath = userBaseArg.getValue();
     this.groupBasePath = groupBaseArg.getValue();
@@ -357,6 +510,21 @@ public class Scim2GroupMemberDestination extends SyncDestination
     this.updateMethod = (updateMethodArg != null && updateMethodArg.getValue() != null) ? 
                         updateMethodArg.getValue().toLowerCase() : "patch";
 
+    // Parse SSL/TLS configuration
+    this.trustStorePath = (trustStorePathArg != null) ? trustStorePathArg.getValue() : null;
+    this.trustStorePassword = (trustStorePasswordArg != null) ? trustStorePasswordArg.getValue() : null;
+    this.trustStoreType = (trustStoreTypeArg != null && trustStoreTypeArg.getValue() != null) ? 
+                          trustStoreTypeArg.getValue() : "JKS";
+    this.allowUntrustedCertificates = (allowUntrustedCertsArg != null && allowUntrustedCertsArg.isPresent());
+
+    // Parse HTTP proxy configuration
+    this.proxyHost = (proxyHostArg != null) ? proxyHostArg.getValue() : null;
+    this.proxyPort = (proxyPortArg != null) ? proxyPortArg.getValue() : null;
+    this.proxyUsername = (proxyUsernameArg != null) ? proxyUsernameArg.getValue() : null;
+    this.proxyPassword = (proxyPasswordArg != null) ? proxyPasswordArg.getValue() : null;
+    this.proxyType = (proxyTypeArg != null && proxyTypeArg.getValue() != null) ? 
+                     proxyTypeArg.getValue().toUpperCase() : "HTTP";
+
     // Parse comma-separated group membership attributes
     String groupMembershipAttrsStr = groupMembershipAttrsArg.getValue();
     this.groupMembershipAttributes = groupMembershipAttrsStr.split(",");
@@ -370,6 +538,16 @@ public class Scim2GroupMemberDestination extends SyncDestination
       // Apache HttpClient has full support for PATCH method without workarounds
       ClientConfig clientConfig = new ClientConfig();
       clientConfig.connectorProvider(new ApacheConnectorProvider());
+      
+      // Configure SSL/TLS settings
+      SSLContext sslContext = createSSLContext();
+      if (sslContext != null) {
+        clientConfig.property("jersey.config.apache.client.sslContext", sslContext);
+      }
+      
+      // Configure HTTP proxy settings
+      configureProxy(clientConfig);
+      
       Client restClient = ClientBuilder.newClient(clientConfig);
       
       // Configure authentication based on auth-type
@@ -413,6 +591,24 @@ public class Scim2GroupMemberDestination extends SyncDestination
       System.out.println("   Group Base: " + this.groupBasePath);
       System.out.println("   Monitoring attributes: " + Arrays.toString(this.groupMembershipAttributes));
       System.out.println("   Username lookup attribute: " + this.usernameLookupAttribute);
+      
+      // Log SSL/TLS configuration
+      if (trustStorePath != null && !trustStorePath.trim().isEmpty()) {
+        System.out.println("   SSL/TLS: Custom truststore (" + trustStoreType + ") - " + trustStorePath);
+      } else if (allowUntrustedCertificates) {
+        System.out.println("   SSL/TLS: ⚠️  WARNING - Accepting untrusted certificates (development/testing only)");
+      } else {
+        System.out.println("   SSL/TLS: Using JVM default truststore");
+      }
+      
+      // Log proxy configuration
+      if (proxyHost != null && !proxyHost.trim().isEmpty()) {
+        System.out.println("   HTTP Proxy: " + proxyType + " proxy at " + proxyHost + ":" + 
+                          (proxyPort != null ? proxyPort : "8080") + 
+                          (proxyUsername != null ? " (with authentication)" : ""));
+      } else {
+        System.out.println("   HTTP Proxy: Direct connection (no proxy)");
+      }
     }
     catch(Exception e)
     {
@@ -1263,6 +1459,74 @@ public class Scim2GroupMemberDestination extends SyncDestination
     @Override
     public void filter(ClientRequestContext requestContext) throws IOException {
       requestContext.getHeaders().add(HttpHeaders.AUTHORIZATION, "Bearer " + bearerToken);
+    }
+  }
+
+  /**
+   * Creates a custom SSL context based on the trust configuration.
+   * Supports custom truststore or trust-all certificates for development/testing.
+   * 
+   * @return SSLContext configured based on trust settings, or null to use default
+   * @throws Exception if there's an error creating the SSL context
+   */
+  private SSLContext createSSLContext() throws Exception {
+    // If custom truststore is specified
+    if (trustStorePath != null && !trustStorePath.trim().isEmpty()) {
+      KeyStore trustStore = KeyStore.getInstance(trustStoreType);
+      try (FileInputStream fis = new FileInputStream(trustStorePath)) {
+        trustStore.load(fis, trustStorePassword != null ? 
+                      trustStorePassword.toCharArray() : null);
+      }
+      
+      TrustManagerFactory tmf = TrustManagerFactory.getInstance(
+          TrustManagerFactory.getDefaultAlgorithm());
+      tmf.init(trustStore);
+      
+      SSLContext sslContext = SSLContext.getInstance("TLS");
+      sslContext.init(null, tmf.getTrustManagers(), null);
+      return sslContext;
+    }
+    
+    // If allowing untrusted certificates (NOT recommended for production)
+    if (allowUntrustedCertificates) {
+      TrustManager[] trustAllCerts = new TrustManager[] {
+        new X509TrustManager() {
+          @Override
+          public X509Certificate[] getAcceptedIssuers() { return null; }
+          @Override
+          public void checkClientTrusted(X509Certificate[] certs, String authType) { }
+          @Override
+          public void checkServerTrusted(X509Certificate[] certs, String authType) { }
+        }
+      };
+      
+      SSLContext sslContext = SSLContext.getInstance("TLS");
+      sslContext.init(null, trustAllCerts, null);
+      return sslContext;
+    }
+    
+    return null; // Use default SSL context
+  }
+
+  /**
+   * Configures HTTP proxy settings on the client configuration.
+   * Supports both HTTP and SOCKS proxies with optional authentication.
+   * 
+   * @param clientConfig The JAX-RS client configuration to modify
+   */
+  private void configureProxy(ClientConfig clientConfig) {
+    if (proxyHost != null && !proxyHost.trim().isEmpty()) {
+      // Set proxy host and port
+      clientConfig.property(ClientProperties.PROXY_URI, 
+          "http://" + proxyHost + ":" + (proxyPort != null ? proxyPort : "8080"));
+      
+      // Set proxy authentication if provided
+      if (proxyUsername != null && !proxyUsername.trim().isEmpty()) {
+        clientConfig.property(ClientProperties.PROXY_USERNAME, proxyUsername);
+        if (proxyPassword != null) {
+          clientConfig.property(ClientProperties.PROXY_PASSWORD, proxyPassword);
+        }
+      }
     }
   }
 }
