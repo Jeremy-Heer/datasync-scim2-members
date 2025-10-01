@@ -61,7 +61,9 @@ import jakarta.ws.rs.client.ClientBuilder;
 import jakarta.ws.rs.client.WebTarget;
 import jakarta.ws.rs.client.ClientRequestFilter;
 import jakarta.ws.rs.client.ClientRequestContext;
+import jakarta.ws.rs.client.Entity;
 import jakarta.ws.rs.core.HttpHeaders;
+import jakarta.ws.rs.core.Response;
 import org.glassfish.jersey.client.authentication.HttpAuthenticationFeature;
 import org.glassfish.jersey.apache.connector.ApacheConnectorProvider;
 import org.glassfish.jersey.client.ClientConfig;
@@ -123,6 +125,9 @@ public class Scim2GroupMemberDestination extends SyncDestination
 
   // SCIM2 service client for API interactions
   private ScimService scimService;
+
+  // Direct JAX-RS client for manual PATCH requests (to avoid SDK's extra fields)
+  private Client jaxrsClient;
 
   // Configuration parameters
   private String baseUrl;
@@ -580,6 +585,9 @@ public class Scim2GroupMemberDestination extends SyncDestination
       // Create SCIM2 service with authenticated client
       WebTarget target = restClient.target(URI.create(this.baseUrl));
       this.scimService = new ScimService(target);
+      
+      // Store the JAX-RS client for direct PATCH requests
+      this.jaxrsClient = restClient;
       
       // Log successful initialization
       System.out.println("✅ SCIM2 Group Membership Sync Destination initialized successfully!");
@@ -1257,22 +1265,29 @@ public class Scim2GroupMemberDestination extends SyncDestination
 
   /**
    * Adds a user to a SCIM2 group using PATCH operation (recommended approach).
-   * Uses Apache HttpClient which has native PATCH support for optimal performance with large groups.
+   * Uses direct JAX-RS client to create RFC 7644 compliant PATCH requests without extra fields.
    */
   private void addUserToScim2GroupViaPatch(final String groupId, final String userId, 
       final SyncOperation operation) throws ScimException {
-    // Create a new member object for the PATCH operation
-    Member newMember = new Member();
-    newMember.setValue(userId);
-    newMember.setRef(URI.create(baseUrl + userBasePath + "/" + userId));
+    // Create manual PATCH request using JAX-RS client to ensure RFC 7644 compliance
+    String patchJson = createAddMemberPatchJson(userId);
     
-    // Use PATCH operation per RFC 7644 Section 3.5.2
-    // Apache HttpClient provides native PATCH support without workarounds
-    scimService.modifyRequest(groupBasePath, groupId)
-        .addValues("members", newMember)
-        .invoke(GroupResource.class);
-    
-    operation.logInfo("Added user " + userId + " to SCIM2 group " + groupId + " via PATCH (RFC 7644)");
+    try {
+      WebTarget target = jaxrsClient.target(baseUrl + groupBasePath + "/" + groupId);
+      Response response = target.request("application/scim+json")
+          .method("PATCH", Entity.entity(patchJson, "application/scim+json"));
+      
+      if (response.getStatus() >= 200 && response.getStatus() < 300) {
+        operation.logInfo("Added user " + userId + " to SCIM2 group " + groupId + " via PATCH (RFC 7644 compliant)");
+      } else {
+        throw new RuntimeException("PATCH request failed with status: " + response.getStatus() + 
+                               " - " + response.readEntity(String.class));
+      }
+      response.close();
+      
+    } catch (Exception e) {
+      throw new RuntimeException("Error executing PATCH request: " + e.getMessage(), e);
+    }
   }
 
   /**
@@ -1346,17 +1361,29 @@ public class Scim2GroupMemberDestination extends SyncDestination
 
   /**
    * Removes a user from a SCIM2 group using PATCH operation (recommended approach).
-   * Uses Apache HttpClient which has native PATCH support for optimal performance with large groups.
+   * Uses direct JAX-RS client to create RFC 7644 compliant PATCH requests without extra fields.
    */
   private void removeUserFromScim2GroupViaPatch(final String groupId, final String userId, 
       final SyncOperation operation) throws ScimException {
-    // Use the path-based remove for the members attribute with filter
-    // Apache HttpClient provides native PATCH support without workarounds
-    scimService.modifyRequest(groupBasePath, groupId)
-        .removeValues("members[value eq \"" + userId + "\"]")
-        .invoke(GroupResource.class);
+    // Create manual PATCH request using JAX-RS client to ensure RFC 7644 compliance
+    String patchJson = createRemoveMemberPatchJson(userId);
     
-    operation.logInfo("Removed user " + userId + " from SCIM2 group " + groupId + " via PATCH (RFC 7644)");
+    try {
+      WebTarget target = jaxrsClient.target(baseUrl + groupBasePath + "/" + groupId);
+      Response response = target.request("application/scim+json")
+          .method("PATCH", Entity.entity(patchJson, "application/scim+json"));
+      
+      if (response.getStatus() >= 200 && response.getStatus() < 300) {
+        operation.logInfo("Removed user " + userId + " from SCIM2 group " + groupId + " via PATCH (RFC 7644 compliant)");
+      } else {
+        throw new RuntimeException("PATCH request failed with status: " + response.getStatus() + 
+                               " - " + response.readEntity(String.class));
+      }
+      response.close();
+      
+    } catch (Exception e) {
+      throw new RuntimeException("Error executing PATCH request: " + e.getMessage(), e);
+    }
   }
 
   /**
@@ -1528,5 +1555,41 @@ public class Scim2GroupMemberDestination extends SyncDestination
         }
       }
     }
+  }
+
+  /**
+   * Creates a proper RFC 7644 compliant PATCH JSON for adding a member to a group.
+   * This method ensures only the required fields (schemas and Operations) are included.
+   */
+  private String createAddMemberPatchJson(final String userId) {
+    StringBuilder json = new StringBuilder();
+    json.append("{");
+    json.append("\"schemas\":[\"urn:ietf:params:scim:api:messages:2.0:PatchOp\"],");
+    json.append("\"Operations\":[{");
+    json.append("\"op\":\"add\",");
+    json.append("\"path\":\"members\",");
+    json.append("\"value\":[{");
+    json.append("\"value\":\"").append(userId).append("\",");
+    json.append("\"$ref\":\"").append(baseUrl).append(userBasePath).append("/").append(userId).append("\"");
+    json.append("}]");
+    json.append("}]");
+    json.append("}");
+    return json.toString();
+  }
+
+  /**
+   * Creates a proper RFC 7644 compliant PATCH JSON for removing a member from a group.
+   * This method ensures only the required fields (schemas and Operations) are included.
+   */
+  private String createRemoveMemberPatchJson(final String userId) {
+    StringBuilder json = new StringBuilder();
+    json.append("{");
+    json.append("\"schemas\":[\"urn:ietf:params:scim:api:messages:2.0:PatchOp\"],");
+    json.append("\"Operations\":[{");
+    json.append("\"op\":\"remove\",");
+    json.append("\"path\":\"members[value eq \\\"").append(userId).append("\\\"]\"");
+    json.append("}]");
+    json.append("}");
+    return json.toString();
   }
 }
