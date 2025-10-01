@@ -46,6 +46,7 @@ import com.unboundid.ldap.sdk.Attribute;
 import com.unboundid.ldap.sdk.Entry;
 import com.unboundid.ldap.sdk.Modification;
 import com.unboundid.ldap.sdk.ModificationType;
+import com.unboundid.ldap.sdk.ChangeLogEntry;
 
 import com.unboundid.scim2.client.ScimService;
 import com.unboundid.scim2.common.types.UserResource;
@@ -93,12 +94,19 @@ import javax.net.ssl.X509TrustManager;
  * - Handles full resync operations by ensuring exact membership alignment
  * - Removes users from extra groups during REPLACE operations (resync scenarios)
  * - Supports multiple authentication methods (Basic Auth, OAuth Bearer Token)
+ * - Configurable group membership lookup behavior for performance optimization
  * 
  * SYNCHRONIZATION FLOW:
  * 1. fetchEntry: Maps LDAP user to SCIM2 user and retrieves current group memberships
  * 2. Standard sync mode compares source vs destination group memberships automatically  
  * 3. modifyEntry: Processes differences and updates SCIM2 groups accordingly
  * 4. REPLACE operations ensure exact membership alignment (adds missing, removes extra)
+ * 
+ * PERFORMANCE OPTIMIZATION:
+ * - When disable-group-membership-lookups is enabled, the destination skips
+ *   checking current membership status via members.value filters and always
+ *   sends group membership add/remove operations. This improves performance
+ *   when the SCIM2 endpoint doesn't efficiently support these filter queries.
  * 
  * ======================================================================
  * IMPLEMENTATION STATUS: ✅ COMPLETE AND OPTIMIZED
@@ -111,6 +119,7 @@ import javax.net.ssl.X509TrustManager;
  * ✅ Comprehensive error handling and logging
  * ✅ Multiple authentication methods supported
  * ✅ Optimized for both incremental and full synchronization scenarios
+ * ✅ Configurable membership lookup behavior for performance tuning
  * 
  * Ready for production deployment to Ping Data Sync server.
  */
@@ -153,6 +162,9 @@ public class Scim2GroupMemberDestination extends SyncDestination
   private String proxyUsername;
   private String proxyPassword;
   private String proxyType;
+
+  // Group membership lookup configuration
+  private boolean disableGroupMembershipLookups;
 
 
   /**
@@ -316,6 +328,16 @@ public class Scim2GroupMemberDestination extends SyncDestination
                                  "Type of proxy server: 'HTTP' for HTTP/HTTPS proxy or " +
                                  "'SOCKS' for SOCKS proxy (default: HTTP).");
 
+    StringArgument disableGroupMembershipLookupsArg = new StringArgument(
+                                 null, "disable-group-membership-lookups", false, 0,
+                                 null, 
+                                 "Disable group membership lookups using members.value type filters. " +
+                                 "When enabled, the destination will always send group membership " +
+                                 "add or remove operations without checking if the user is already " +
+                                 "a member or not. This can improve performance when the SCIM2 " +
+                                 "endpoint does not efficiently support members.value filters, " +
+                                 "but may result in redundant API calls.");
+
     parser.addArgument(baseUrlArg);
     parser.addArgument(userBaseArg);
     parser.addArgument(groupBaseArg);
@@ -335,6 +357,7 @@ public class Scim2GroupMemberDestination extends SyncDestination
     parser.addArgument(proxyUsernameArg);
     parser.addArgument(proxyPasswordArg);
     parser.addArgument(proxyTypeArg);
+    parser.addArgument(disableGroupMembershipLookupsArg);
   }
 
 
@@ -407,7 +430,18 @@ public class Scim2GroupMemberDestination extends SyncDestination
                     "username-lookup-attribute=uid",
                     "allow-untrusted-certificates"),
           "Development/testing configuration that accepts untrusted SSL certificates " +
-          "(self-signed, expired, wrong hostname). ⚠️ WARNING: Only use in non-production environments!");
+          "(self-signed, expired, wrong hostname). WARNING: Only use in non-production environments!");
+
+    exampleMap.put(
+      Arrays.asList("base-url=https://example.com/scim/v2", 
+                    "user-base=/Users", "group-base=/Groups",
+                    "username=syncuser", "password=p@ssW0rd",
+                    "group-membership-attributes=memberOf",
+                    "username-lookup-attribute=uid",
+                    "disable-group-membership-lookups"),
+          "High-performance configuration that disables group membership lookups. " +
+          "Always sends group membership operations without checking current state, " +
+          "ideal for SCIM2 endpoints that don't efficiently support members.value filters.");
 
     return exampleMap;
   }
@@ -499,6 +533,9 @@ public class Scim2GroupMemberDestination extends SyncDestination
     StringArgument proxyTypeArg = (StringArgument)
                               parser.getNamedArgument("proxy-type");
 
+    StringArgument disableGroupMembershipLookupsArg = (StringArgument)
+                              parser.getNamedArgument("disable-group-membership-lookups");
+
     this.baseUrl = baseUrlArg.getValue();
     this.userBasePath = userBaseArg.getValue();
     this.groupBasePath = groupBaseArg.getValue();
@@ -529,6 +566,10 @@ public class Scim2GroupMemberDestination extends SyncDestination
     this.proxyPassword = (proxyPasswordArg != null) ? proxyPasswordArg.getValue() : null;
     this.proxyType = (proxyTypeArg != null && proxyTypeArg.getValue() != null) ? 
                      proxyTypeArg.getValue().toUpperCase() : "HTTP";
+
+    // Parse group membership lookup configuration (default to false - enable lookups)
+    this.disableGroupMembershipLookups = (disableGroupMembershipLookupsArg != null && 
+                                         disableGroupMembershipLookupsArg.isPresent());
 
     // Parse comma-separated group membership attributes
     String groupMembershipAttrsStr = groupMembershipAttrsArg.getValue();
@@ -604,7 +645,7 @@ public class Scim2GroupMemberDestination extends SyncDestination
       if (trustStorePath != null && !trustStorePath.trim().isEmpty()) {
         System.out.println("   SSL/TLS: Custom truststore (" + trustStoreType + ") - " + trustStorePath);
       } else if (allowUntrustedCertificates) {
-        System.out.println("   SSL/TLS: ⚠️  WARNING - Accepting untrusted certificates (development/testing only)");
+        System.out.println("   SSL/TLS: WARNING - Accepting untrusted certificates (development/testing only)");
       } else {
         System.out.println("   SSL/TLS: Using JVM default truststore");
       }
@@ -617,6 +658,10 @@ public class Scim2GroupMemberDestination extends SyncDestination
       } else {
         System.out.println("   HTTP Proxy: Direct connection (no proxy)");
       }
+      
+      // Log group membership lookup configuration
+      System.out.println("   Group Membership Lookups: " + 
+                        (disableGroupMembershipLookups ? "DISABLED (always send operations)" : "ENABLED (check before operations)"));
     }
     catch(Exception e)
     {
@@ -804,8 +849,9 @@ public class Scim2GroupMemberDestination extends SyncDestination
       return;
     }
 
-    // In standard synchronization mode, entryToModify is the synthetic entry from fetchEntry
-    // which contains the username and SCIM2 user ID
+    // Handle both standard and notification synchronization modes:
+    // - In standard mode: entryToModify is the synthetic entry from fetchEntry with scim2UserId
+    // - In notification mode: entryToModify is the mapped source entry, need to lookup scim2UserId
     String username = null;
     String scim2UserId = null;
     
@@ -814,9 +860,19 @@ public class Scim2GroupMemberDestination extends SyncDestination
       username = usernameAttr.getValue();
     }
     
+    // Try to get scim2UserId from synthetic entry (standard mode)
     Attribute scim2UserIdAttr = entryToModify.getAttribute("scim2UserId");
     if (scim2UserIdAttr != null && scim2UserIdAttr.getValue() != null) {
       scim2UserId = scim2UserIdAttr.getValue();
+    } else if (username != null) {
+      // In notification mode, lookup the SCIM2 user ID
+      scim2UserId = findScim2UserId(username, operation);
+    } else {
+      // In notification mode, if username not in entry, try alternative methods
+      username = getUsernameFromNotificationMode(entryToModify, operation);
+      if (username != null) {
+        scim2UserId = findScim2UserId(username, operation);
+      }
     }
     
     if (username == null || scim2UserId == null) {
@@ -861,7 +917,15 @@ public class Scim2GroupMemberDestination extends SyncDestination
       return;
     }
     
-    // Handle ADD and DELETE operations
+    // Handle DELETE operations with null/empty values - this means remove from all groups for this attribute
+    if (ModificationType.DELETE.equals(modType) && (values == null || values.length == 0)) {
+      operation.logInfo("Processing DELETE operation with no specific values - removing user from all groups for attribute: " + 
+                       modification.getAttributeName());
+      processDeleteAllGroupMemberships(modification.getAttributeName(), scim2UserId, operation);
+      return;
+    }
+    
+    // Handle ADD and DELETE operations with specific values
     if (values == null || values.length == 0) {
       return;
     }
@@ -909,7 +973,8 @@ public class Scim2GroupMemberDestination extends SyncDestination
       final String scim2UserId, final SyncOperation operation) throws EndpointException {
     
     // Get current group memberships for this attribute
-    List<String> currentGroups = getCurrentGroupMembershipsForAttribute(attributeName, scim2UserId, operation);
+    // In notification mode with lookups disabled, try to get "before" values from changelog
+    List<String> currentGroups = getCurrentGroupMembershipsForReplace(attributeName, scim2UserId, operation);
     
     // Determine target group names (empty list if newGroupNames is null)
     List<String> targetGroups = new ArrayList<String>();
@@ -964,6 +1029,47 @@ public class Scim2GroupMemberDestination extends SyncDestination
   }
 
   /**
+   * Processes a DELETE operation for all group memberships when no specific values are provided.
+   * This handles the case where all values are removed from a group membership attribute,
+   * which should result in removing the user from all groups associated with that attribute.
+   * 
+   * @param attributeName The name of the group membership attribute
+   * @param scim2UserId The SCIM2 user ID
+   * @param operation The sync operation for logging
+   * @throws EndpointException If there's an error during processing
+   */
+  private void processDeleteAllGroupMemberships(final String attributeName, final String scim2UserId, 
+      final SyncOperation operation) throws EndpointException {
+    
+    // Get current group memberships for this attribute
+    List<String> currentGroups = getCurrentGroupMembershipsForAttribute(attributeName, scim2UserId, operation);
+    
+    if (currentGroups.isEmpty()) {
+      operation.logInfo("User " + scim2UserId + " has no current group memberships for attribute " + 
+                       attributeName + " - nothing to remove");
+      return;
+    }
+    
+    operation.logInfo("DELETE all operation for attribute " + attributeName + 
+                     ": removing user from " + currentGroups.size() + " groups");
+    
+    // Remove user from all current groups
+    for (String groupName : currentGroups) {
+      String scim2GroupId = findScim2GroupId(groupName, operation);
+      if (scim2GroupId != null) {
+        try {
+          removeUserFromScim2Group(scim2GroupId, scim2UserId, operation);
+        } catch (EndpointException e) {
+          operation.logInfo("Error removing user from group " + groupName + ": " + e.getMessage());
+          // Continue with other groups rather than failing the entire operation
+        }
+      } else {
+        operation.logInfo("Skipping remove - SCIM2 group not found: " + groupName);
+      }
+    }
+  }
+
+  /**
    * Retrieves current group memberships for a specific attribute by searching SCIM2.
    * This is used during REPLACE operations to determine which groups need to be added or removed.
    * Optimized for large groups by requesting only essential attributes.
@@ -976,6 +1082,13 @@ public class Scim2GroupMemberDestination extends SyncDestination
   private List<String> getCurrentGroupMembershipsForAttribute(final String attributeName, 
       final String scim2UserId, final SyncOperation operation) {
     List<String> currentGroups = new ArrayList<String>();
+    
+    // Check if group membership lookups are disabled
+    if (disableGroupMembershipLookups) {
+      operation.logInfo("Group membership lookups disabled - returning empty list for attribute " + 
+                       attributeName + " and user " + scim2UserId);
+      return currentGroups; // Return empty list
+    }
     
     try {
       // Search for all groups where this user is a member
@@ -1025,6 +1138,90 @@ public class Scim2GroupMemberDestination extends SyncDestination
     return currentGroups;
   }
 
+  /**
+   * Retrieves current group memberships for REPLACE operations.
+   * In notification mode with lookups disabled, attempts to get "before" values from changelog.
+   * Otherwise, falls back to standard SCIM2 lookup.
+   * 
+   * @param attributeName The group membership attribute name
+   * @param scim2UserId The SCIM2 user ID 
+   * @param operation The sync operation
+   * @return List of current group display names
+   */
+  private List<String> getCurrentGroupMembershipsForReplace(final String attributeName, 
+      final String scim2UserId, final SyncOperation operation) {
+    
+    // If lookups are disabled, try to get "before" values from changelog (notification mode)
+    if (disableGroupMembershipLookups) {
+      List<String> beforeGroups = getBeforeGroupsFromChangelog(attributeName, operation);
+      if (beforeGroups != null) {
+        operation.logInfo("Using changelog before values for REPLACE - found " + beforeGroups.size() + 
+                         " previous groups for attribute " + attributeName);
+        return beforeGroups;
+      } else {
+        operation.logInfo("No changelog before values available - falling back to empty list for attribute " + attributeName);
+        return new ArrayList<String>();
+      }
+    }
+    
+    // Standard mode or notification mode with lookups enabled - use SCIM2 lookup
+    return getCurrentGroupMembershipsForAttribute(attributeName, scim2UserId, operation);
+  }
+
+  /**
+   * Attempts to extract "before" group values from changelog entry.
+   * This is used in notification mode to determine what groups to remove during REPLACE operations.
+   * 
+   * @param attributeName The group membership attribute name
+   * @param operation The sync operation
+   * @return List of group names from before values, or null if not available
+   */
+  private List<String> getBeforeGroupsFromChangelog(final String attributeName, final SyncOperation operation) {
+    try {
+      // Get the changelog entry from the operation
+      ChangeLogEntry changeLogEntry = operation.getChangeLogEntry();
+      if (changeLogEntry != null) {
+        
+        // Look for ds-changelog-before-values attribute
+        Attribute beforeValuesAttr = changeLogEntry.getAttribute("ds-changelog-before-values");
+        if (beforeValuesAttr != null) {
+          
+          List<String> beforeGroups = new ArrayList<String>();
+          
+          // Parse the before values - format is like:
+          // "jeremy-att: developers\njeremy-att: devops\nmodifyTimestamp: ..."
+          for (String beforeValue : beforeValuesAttr.getValues()) {
+            String[] lines = beforeValue.split("\n");
+            for (String line : lines) {
+              line = line.trim();
+              if (line.startsWith(attributeName + ":")) {
+                String groupValue = line.substring((attributeName + ":").length()).trim();
+                if (!groupValue.isEmpty()) {
+                  beforeGroups.add(groupValue);
+                  operation.logInfo("Found before group value: " + groupValue + " for attribute: " + attributeName);
+                }
+              }
+            }
+          }
+          
+          if (!beforeGroups.isEmpty()) {
+            operation.logInfo("Extracted " + beforeGroups.size() + " before group values from changelog for attribute: " + attributeName);
+            return beforeGroups;
+          }
+        } else {
+          operation.logInfo("No ds-changelog-before-values attribute found in changelog entry");
+        }
+      } else {
+        operation.logInfo("No changelog entry available in sync operation");
+      }
+      
+    } catch (Exception e) {
+      operation.logInfo("Error extracting before groups from changelog: " + e.getMessage());
+    }
+    
+    return null;
+  }
+
 
 
   /**
@@ -1067,6 +1264,75 @@ public class Scim2GroupMemberDestination extends SyncDestination
                      entryToDelete.getDN());
   }
 
+  /**
+   * Extracts the username from notification mode entry or changelog entry.
+   * In notification mode, we try multiple approaches to get the username.
+   * 
+   * @param entryToModify The entry being modified (may have limited data in notification mode)
+   * @param operation The sync operation
+   * @return The username if found, null otherwise
+   */
+  private String getUsernameFromNotificationMode(final Entry entryToModify, final SyncOperation operation) {
+    try {
+      // First try: get username from the entry itself (if available)
+      if (entryToModify != null) {
+        Attribute usernameAttr = entryToModify.getAttribute(usernameLookupAttribute);
+        if (usernameAttr != null && usernameAttr.getValue() != null) {
+          operation.logInfo("Found username from entry: " + usernameAttr.getValue());
+          return usernameAttr.getValue();
+        }
+      }
+      
+      // Second try: extract from DN
+      String dn = entryToModify != null ? entryToModify.getDN() : null;
+      if (dn != null) {
+        String usernameFromDN = extractUsernameFromDN(dn, operation);
+        if (usernameFromDN != null) {
+          operation.logInfo("Extracted username from DN: " + usernameFromDN);
+          return usernameFromDN;
+        }
+      }
+      
+    } catch (Exception e) {
+      operation.logInfo("Error extracting username in notification mode: " + e.getMessage());
+    }
+    
+    return null;
+  }
+
+  /**
+   * Extracts username from a DN string as a fallback method.
+   * Looks for common username attributes in the RDN.
+   * 
+   * @param dn The distinguished name
+   * @param operation The sync operation for logging
+   * @return The username if found, null otherwise
+   */
+  private String extractUsernameFromDN(final String dn, final SyncOperation operation) {
+    try {
+      // Simple parsing for common patterns like "uid=username,..." or "cn=username,..."
+      if (dn != null && dn.toLowerCase().startsWith("uid=")) {
+        int commaIndex = dn.indexOf(',');
+        if (commaIndex > 4) {
+          return dn.substring(4, commaIndex);
+        } else if (commaIndex == -1) {
+          return dn.substring(4);
+        }
+      } else if (dn != null && dn.toLowerCase().startsWith("cn=")) {
+        int commaIndex = dn.indexOf(',');
+        if (commaIndex > 3) {
+          return dn.substring(3, commaIndex);
+        } else if (commaIndex == -1) {
+          return dn.substring(3);
+        }
+      }
+      // Add more patterns as needed
+    } catch (Exception e) {
+      operation.logInfo("Error parsing DN for username: " + e.getMessage());
+    }
+    return null;
+  }
+
 
 
   /**
@@ -1105,6 +1371,12 @@ public class Scim2GroupMemberDestination extends SyncDestination
       // Initialize all group membership attributes with empty values
       for (String groupAttr : groupMembershipAttributes) {
         syntheticEntry.addAttribute(groupAttr, new String[0]);
+      }
+      
+      // Check if group membership lookups are disabled
+      if (disableGroupMembershipLookups) {
+        operation.logInfo("Group membership lookups disabled - skipping population for user " + scim2UserId);
+        return; // Leave all attributes empty
       }
       
       // Search for all groups where this user is a member
@@ -1306,8 +1578,9 @@ public class Scim2GroupMemberDestination extends SyncDestination
         return;
       }
       
-      // First check if user is already a member to avoid unnecessary API calls
-      if (isUserMemberOfGroup(groupId, userId, operation)) {
+      // Check if user is already a member to avoid unnecessary API calls
+      // But if lookups are disabled, we always attempt the add operation
+      if (!disableGroupMembershipLookups && isUserMemberOfGroup(groupId, userId, operation)) {
         operation.logInfo("User " + userId + " is already a member of group " + groupId);
         return;
       }
@@ -1447,8 +1720,9 @@ public class Scim2GroupMemberDestination extends SyncDestination
         return;
       }
       
-      // First check if user is actually a member to avoid unnecessary API calls
-      if (!isUserMemberOfGroup(groupId, userId, operation)) {
+      // Check if user is actually a member to avoid unnecessary API calls
+      // But if lookups are disabled, we always attempt the remove operation
+      if (!disableGroupMembershipLookups && !isUserMemberOfGroup(groupId, userId, operation)) {
         operation.logInfo("User " + userId + " is not a member of group " + groupId);
         return;
       }
@@ -1593,6 +1867,13 @@ public class Scim2GroupMemberDestination extends SyncDestination
    */
   protected boolean isUserMemberOfGroup(final String groupId, final String userId, 
       final SyncOperation operation) {
+    // Check if group membership lookups are disabled
+    if (disableGroupMembershipLookups) {
+      operation.logInfo("Group membership lookups disabled - skipping membership check for user " + 
+                       userId + " in group " + groupId);
+      return false; // Always return false to ensure operations are attempted
+    }
+    
     try {
       // Use a search filter to check membership without retrieving full group data
       // This is much more efficient for large groups as it only returns the count
