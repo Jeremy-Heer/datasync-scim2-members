@@ -981,11 +981,29 @@ public class Scim2GroupMemberDestination extends SyncDestination
       // Search for all groups where this user is a member
       // Request only displayName and id to minimize data transfer for large groups
       Filter userMemberFilter = Filter.eq("members.value", scim2UserId);
+      
+      // Debug logging for request
+      if (serverContext.debugEnabled()) {
+        serverContext.debugInfo("SCIM2 Current Group Memberships Request - Attribute: " + attributeName + 
+                              ", User ID: " + scim2UserId + 
+                              ", Base Path: " + groupBasePath + 
+                              ", Filter: " + userMemberFilter.toString());
+      }
+      
       ListResponse<GroupResource> groupSearchResponse = 
           scimService.searchRequest(groupBasePath)
               .filter(userMemberFilter.toString())
               .attributes("id", "displayName") // Only request essential attributes
               .invoke(GroupResource.class);
+      
+      // Debug logging for response
+      if (serverContext.debugEnabled()) {
+        serverContext.debugInfo("SCIM2 Current Group Memberships Response - Attribute: " + attributeName + 
+                              ", User ID: " + scim2UserId + 
+                              ", Total Results: " + groupSearchResponse.getTotalResults() + 
+                              ", Resources Count: " + 
+                              (groupSearchResponse.getResources() != null ? groupSearchResponse.getResources().size() : 0));
+      }
       
       if (groupSearchResponse.getTotalResults() > 0) {
         for (GroupResource group : groupSearchResponse.getResources()) {
@@ -1093,11 +1111,27 @@ public class Scim2GroupMemberDestination extends SyncDestination
       // Using a filter to find groups that contain this user ID in their members
       // Request only displayName and id to minimize data transfer for large groups
       Filter userMemberFilter = Filter.eq("members.value", scim2UserId);
+      
+      // Debug logging for request
+      if (serverContext.debugEnabled()) {
+        serverContext.debugInfo("SCIM2 Group Membership Population Request - User ID: " + scim2UserId + 
+                              ", Base Path: " + groupBasePath + 
+                              ", Filter: " + userMemberFilter.toString());
+      }
+      
       ListResponse<GroupResource> groupSearchResponse = 
           scimService.searchRequest(groupBasePath)
               .filter(userMemberFilter.toString())
               .attributes("id", "displayName") // Only request essential attributes
               .invoke(GroupResource.class);
+      
+      // Debug logging for response
+      if (serverContext.debugEnabled()) {
+        serverContext.debugInfo("SCIM2 Group Membership Population Response - User ID: " + scim2UserId + 
+                              ", Total Results: " + groupSearchResponse.getTotalResults() + 
+                              ", Resources Count: " + 
+                              (groupSearchResponse.getResources() != null ? groupSearchResponse.getResources().size() : 0));
+      }
       
       if (groupSearchResponse.getTotalResults() > 0) {
         // Collect all group display names
@@ -1154,10 +1188,26 @@ public class Scim2GroupMemberDestination extends SyncDestination
       
       // Search for SCIM2 user using Filter
       Filter filter = Filter.eq("userName", username);
+      
+      // Debug logging for request
+      if (serverContext.debugEnabled()) {
+        serverContext.debugInfo("SCIM2 User Search Request - Base Path: " + userBasePath + 
+                              ", Filter: " + filter.toString() + 
+                              ", Username: " + username);
+      }
+      
       ListResponse<UserResource> searchResponse =
         scimService.searchRequest(userBasePath)
           .filter(filter.toString())
           .invoke(UserResource.class);
+      
+      // Debug logging for response
+      if (serverContext.debugEnabled()) {
+        serverContext.debugInfo("SCIM2 User Search Response - Username: " + username + 
+                              ", Total Results: " + searchResponse.getTotalResults() + 
+                              ", Resources Count: " + 
+                              (searchResponse.getResources() != null ? searchResponse.getResources().size() : 0));
+      }
       
       if (searchResponse.getTotalResults() > 0) {
         UserResource user = searchResponse.getResources().get(0);
@@ -1197,10 +1247,26 @@ public class Scim2GroupMemberDestination extends SyncDestination
       
       // Search for SCIM2 group using Filter
       Filter filter = Filter.eq("displayName", groupName);
+      
+      // Debug logging for request
+      if (serverContext.debugEnabled()) {
+        serverContext.debugInfo("SCIM2 Group Search Request - Base Path: " + groupBasePath + 
+                              ", Filter: " + filter.toString() + 
+                              ", Group Name: " + groupName);
+      }
+      
       ListResponse<GroupResource> searchResponse =
         scimService.searchRequest(groupBasePath)
           .filter(filter.toString())
           .invoke(GroupResource.class);
+      
+      // Debug logging for response
+      if (serverContext.debugEnabled()) {
+        serverContext.debugInfo("SCIM2 Group Search Response - Group Name: " + groupName + 
+                              ", Total Results: " + searchResponse.getTotalResults() + 
+                              ", Resources Count: " + 
+                              (searchResponse.getResources() != null ? searchResponse.getResources().size() : 0));
+      }
       
       if (searchResponse.getTotalResults() > 0) {
         GroupResource group = searchResponse.getResources().get(0);
@@ -1272,16 +1338,38 @@ public class Scim2GroupMemberDestination extends SyncDestination
     // Create manual PATCH request using JAX-RS client to ensure RFC 7644 compliance
     String patchJson = createAddMemberPatchJson(userId);
     
+    // Debug logging for request
+    if (serverContext.debugEnabled()) {
+      serverContext.debugInfo("SCIM2 Group PATCH Add Request - Group ID: " + groupId + 
+                            ", User ID: " + userId + 
+                            ", URL: " + baseUrl + groupBasePath + "/" + groupId + 
+                            ", Request Body: " + patchJson);
+    }
+    
     try {
       WebTarget target = jaxrsClient.target(baseUrl + groupBasePath + "/" + groupId);
       Response response = target.request("application/scim+json")
           .method("PATCH", Entity.entity(patchJson, "application/scim+json"));
       
+      // Debug logging for response
+      if (serverContext.debugEnabled()) {
+        String responseBody = response.hasEntity() ? response.readEntity(String.class) : "";
+        serverContext.debugInfo("SCIM2 Group PATCH Add Response - Group ID: " + groupId + 
+                              ", User ID: " + userId + 
+                              ", Status: " + response.getStatus() + 
+                              ", Response Body: " + responseBody);
+        // Need to close and recreate response for subsequent reading
+        response.close();
+        response = target.request("application/scim+json")
+            .method("PATCH", Entity.entity(patchJson, "application/scim+json"));
+      }
+      
       if (response.getStatus() >= 200 && response.getStatus() < 300) {
         operation.logInfo("Added user " + userId + " to SCIM2 group " + groupId + " via PATCH (RFC 7644 compliant)");
       } else {
+        String errorBody = response.hasEntity() ? response.readEntity(String.class) : "No response body";
         throw new RuntimeException("PATCH request failed with status: " + response.getStatus() + 
-                               " - " + response.readEntity(String.class));
+                               " - " + errorBody);
       }
       response.close();
       
@@ -1295,6 +1383,14 @@ public class Scim2GroupMemberDestination extends SyncDestination
    */
   private void addUserToScim2GroupViaPut(final String groupId, final String userId, 
       final SyncOperation operation) throws ScimException {
+    
+    // Debug logging for request
+    if (serverContext.debugEnabled()) {
+      serverContext.debugInfo("SCIM2 Group PUT Add Request - Group ID: " + groupId + 
+                            ", User ID: " + userId + 
+                            ", Retrieving group for modification");
+    }
+    
     // Retrieve the SCIM2 group
     GroupResource group = scimService.retrieve(groupBasePath, groupId, GroupResource.class);
     List<Member> members = group.getMembers();
@@ -1312,8 +1408,23 @@ public class Scim2GroupMemberDestination extends SyncDestination
     // Strip read-only and immutable attributes per RFC 7643 Section 3.1
     stripReadOnlyAttributes(group);
     
+    // Debug logging for the replacement request
+    if (serverContext.debugEnabled()) {
+      serverContext.debugInfo("SCIM2 Group PUT Add Replace Request - Group ID: " + groupId + 
+                            ", User ID: " + userId + 
+                            ", Members Count: " + members.size() + 
+                            ", Executing PUT replace operation");
+    }
+    
     // Replace the group with updated members list
     group = scimService.replace(group);
+    
+    // Debug logging for response
+    if (serverContext.debugEnabled()) {
+      serverContext.debugInfo("SCIM2 Group PUT Add Replace Response - Group ID: " + groupId + 
+                            ", User ID: " + userId + 
+                            ", Operation completed successfully");
+    }
     operation.logInfo("Added user " + userId + " to SCIM2 group " + groupId + " via PUT (metadata stripped per RFC 7643)");
   }
 
@@ -1368,16 +1479,38 @@ public class Scim2GroupMemberDestination extends SyncDestination
     // Create manual PATCH request using JAX-RS client to ensure RFC 7644 compliance
     String patchJson = createRemoveMemberPatchJson(userId);
     
+    // Debug logging for request
+    if (serverContext.debugEnabled()) {
+      serverContext.debugInfo("SCIM2 Group PATCH Remove Request - Group ID: " + groupId + 
+                            ", User ID: " + userId + 
+                            ", URL: " + baseUrl + groupBasePath + "/" + groupId + 
+                            ", Request Body: " + patchJson);
+    }
+    
     try {
       WebTarget target = jaxrsClient.target(baseUrl + groupBasePath + "/" + groupId);
       Response response = target.request("application/scim+json")
           .method("PATCH", Entity.entity(patchJson, "application/scim+json"));
       
+      // Debug logging for response
+      if (serverContext.debugEnabled()) {
+        String responseBody = response.hasEntity() ? response.readEntity(String.class) : "";
+        serverContext.debugInfo("SCIM2 Group PATCH Remove Response - Group ID: " + groupId + 
+                              ", User ID: " + userId + 
+                              ", Status: " + response.getStatus() + 
+                              ", Response Body: " + responseBody);
+        // Need to close and recreate response for subsequent reading
+        response.close();
+        response = target.request("application/scim+json")
+            .method("PATCH", Entity.entity(patchJson, "application/scim+json"));
+      }
+      
       if (response.getStatus() >= 200 && response.getStatus() < 300) {
         operation.logInfo("Removed user " + userId + " from SCIM2 group " + groupId + " via PATCH (RFC 7644 compliant)");
       } else {
+        String errorBody = response.hasEntity() ? response.readEntity(String.class) : "No response body";
         throw new RuntimeException("PATCH request failed with status: " + response.getStatus() + 
-                               " - " + response.readEntity(String.class));
+                               " - " + errorBody);
       }
       response.close();
       
@@ -1391,6 +1524,14 @@ public class Scim2GroupMemberDestination extends SyncDestination
    */
   private void removeUserFromScim2GroupViaPut(final String groupId, final String userId, 
       final SyncOperation operation) throws ScimException {
+    
+    // Debug logging for request
+    if (serverContext.debugEnabled()) {
+      serverContext.debugInfo("SCIM2 Group PUT Remove Request - Group ID: " + groupId + 
+                            ", User ID: " + userId + 
+                            ", Retrieving group for modification");
+    }
+    
     // Retrieve the SCIM2 group
     GroupResource group = scimService.retrieve(groupBasePath, groupId, GroupResource.class);
     List<Member> members = group.getMembers();
@@ -1400,13 +1541,32 @@ public class Scim2GroupMemberDestination extends SyncDestination
     }
     
     // Remove the member from the list
+    int originalSize = members.size();
     members.removeIf(member -> userId.equals(member.getValue()));
+    int newSize = members.size();
     
     // Strip read-only and immutable attributes per RFC 7643 Section 3.1
     stripReadOnlyAttributes(group);
     
+    // Debug logging for the replacement request
+    if (serverContext.debugEnabled()) {
+      serverContext.debugInfo("SCIM2 Group PUT Remove Replace Request - Group ID: " + groupId + 
+                            ", User ID: " + userId + 
+                            ", Original Members Count: " + originalSize + 
+                            ", New Members Count: " + newSize + 
+                            ", Executing PUT replace operation");
+    }
+    
     // Replace the group with updated members list
     group = scimService.replace(group);
+    
+    // Debug logging for response
+    if (serverContext.debugEnabled()) {
+      serverContext.debugInfo("SCIM2 Group PUT Remove Replace Response - Group ID: " + groupId + 
+                            ", User ID: " + userId + 
+                            ", Operation completed successfully");
+    }
+    
     operation.logInfo("Removed user " + userId + " from SCIM2 group " + groupId + " via PUT (metadata stripped per RFC 7643)");
   }
 
@@ -1441,14 +1601,30 @@ public class Scim2GroupMemberDestination extends SyncDestination
           Filter.eq("members.value", userId)
       );
       
+      // Debug logging for membership check request
+      if (serverContext.debugEnabled()) {
+        serverContext.debugInfo("SCIM2 Group Membership Check Request - Group ID: " + groupId + 
+                              ", User ID: " + userId + 
+                              ", Filter: " + membershipFilter.toString());
+      }
+      
       ListResponse<GroupResource> searchResponse = 
           scimService.searchRequest(groupBasePath)
               .filter(membershipFilter.toString())
               .attributes("id") // Only request minimal attributes
               .invoke(GroupResource.class);
       
-      // If we get any results, the user is a member
-      return searchResponse.getTotalResults() > 0;
+      boolean isMember = searchResponse.getTotalResults() > 0;
+      
+      // Debug logging for membership check response
+      if (serverContext.debugEnabled()) {
+        serverContext.debugInfo("SCIM2 Group Membership Check Response - Group ID: " + groupId + 
+                              ", User ID: " + userId + 
+                              ", Is Member: " + isMember + 
+                              ", Total Results: " + searchResponse.getTotalResults());
+      }
+      
+      return isMember;
       
     } catch (Exception e) {
       operation.logInfo("Error checking group membership for user " + userId + " in group " + groupId + ": " + e.getMessage());
