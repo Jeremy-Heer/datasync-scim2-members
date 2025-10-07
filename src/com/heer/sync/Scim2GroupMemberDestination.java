@@ -81,26 +81,42 @@ import javax.net.ssl.X509TrustManager;
 
 /**
  * This implementation provides a SCIM2 destination for group membership synchronization.
- * It monitors changes to specified group membership attributes on LDAP users and
- * updates corresponding SCIM2 groups by adding or removing users based on the changes.
+ * It supports both incremental user membership changes and full group resync operations.
  * 
- * This destination uses standard synchronization mode, which provides reliable access
- * to complete user information and enables accurate comparison between source and 
- * destination group memberships.
+ * OPERATING MODES:
+ * 
+ * 1. USER MEMBERSHIP SYNC (Incremental):
+ *    - Monitors changes to specified group membership attributes on LDAP users
+ *    - Updates corresponding SCIM2 groups by adding or removing users based on changes
+ *    - Uses standard synchronization mode for reliable comparison
+ * 
+ * 2. GROUP RESYNC (Full):
+ *    - Ignores user resync operations (createEntry for users)
+ *    - Processes group resync operations via modifyEntry
+ *    - Reads members attribute containing user IDs from source plugin
+ *    - Searches SCIM2 for each user ID to get SCIM2 user IDs
+ *    - Replaces entire SCIM2 group membership with PUT operation
  * 
  * KEY FEATURES:
  * - Fetches current SCIM2 group memberships during fetchEntry for accurate comparison
  * - Supports both PATCH (recommended) and PUT update methods via configuration
- * - Handles full resync operations by ensuring exact membership alignment
+ * - Handles full resync operations by replacing entire membership lists
  * - Removes users from extra groups during REPLACE operations (resync scenarios)
  * - Supports multiple authentication methods (Basic Auth, OAuth Bearer Token)
  * - Configurable group membership lookup behavior for performance optimization
  * 
- * SYNCHRONIZATION FLOW:
+ * USER SYNCHRONIZATION FLOW:
  * 1. fetchEntry: Maps LDAP user to SCIM2 user and retrieves current group memberships
  * 2. Standard sync mode compares source vs destination group memberships automatically  
  * 3. modifyEntry: Processes differences and updates SCIM2 groups accordingly
  * 4. REPLACE operations ensure exact membership alignment (adds missing, removes extra)
+ * 
+ * GROUP RESYNC FLOW:
+ * 1. fetchEntry: Maps LDAP group to SCIM2 group by group name
+ * 2. modifyEntry: Detects group entry (has scim2GroupId attribute)
+ * 3. processGroupResync: Reads members attribute (user IDs from source plugin)
+ * 4. Searches SCIM2 for each user ID to get SCIM2 user IDs
+ * 5. Performs PUT operation to replace entire group membership
  * 
  * PERFORMANCE OPTIMIZATION:
  * - When disable-group-membership-lookups is enabled, the destination skips
@@ -115,6 +131,7 @@ import javax.net.ssl.X509TrustManager;
  * This implementation is complete with enhanced group membership synchronization:
  * ✅ Accurate group membership comparison using fetchEntry population
  * ✅ Full resync support with membership cleanup (removes extra memberships)
+ * ✅ Group resync support for dynamic groups via source plugin
  * ✅ Configurable PATCH/PUT update methods with RFC compliance
  * ✅ Comprehensive error handling and logging
  * ✅ Multiple authentication methods supported
@@ -165,6 +182,12 @@ public class Scim2GroupMemberDestination extends SyncDestination
 
   // Group membership lookup configuration
   private boolean disableGroupMembershipLookups;
+
+  // Retry and timeout configuration
+  private int maxRetries;
+  private int retryDelayMs;
+  private int connectTimeoutMs;
+  private int readTimeoutMs;
 
 
   /**
@@ -338,6 +361,39 @@ public class Scim2GroupMemberDestination extends SyncDestination
                                  "endpoint does not efficiently support members.value filters, " +
                                  "but may result in redundant API calls.");
 
+    // Retry and timeout configuration
+    StringArgument maxRetriesArg = new StringArgument(
+                                 null, "max-retries", false, 1,
+                                 "{count}", 
+                                 "Maximum number of retry attempts for failed SCIM2 operations. " +
+                                 "When a SCIM2 API call fails due to network or server issues, " +
+                                 "the operation will be retried up to this many times with " +
+                                 "exponential backoff between attempts (default: 3).");
+
+    StringArgument retryDelayArg = new StringArgument(
+                                 null, "retry-delay-ms", false, 1,
+                                 "{milliseconds}", 
+                                 "Initial delay in milliseconds between retry attempts. " +
+                                 "Uses exponential backoff, so subsequent retries will wait " +
+                                 "longer (e.g., 1000ms, 2000ms, 4000ms). This helps avoid " +
+                                 "overwhelming a recovering server (default: 1000).");
+
+    StringArgument connectTimeoutArg = new StringArgument(
+                                 null, "connect-timeout-ms", false, 1,
+                                 "{milliseconds}", 
+                                 "Connection timeout in milliseconds for SCIM2 HTTP requests. " +
+                                 "If a connection cannot be established within this time, the " +
+                                 "request will fail and may be retried based on max-retries " +
+                                 "setting (default: 30000 = 30 seconds).");
+
+    StringArgument readTimeoutArg = new StringArgument(
+                                 null, "read-timeout-ms", false, 1,
+                                 "{milliseconds}", 
+                                 "Read timeout in milliseconds for SCIM2 HTTP requests. " +
+                                 "If a response is not received within this time after connection " +
+                                 "is established, the request will fail and may be retried based " +
+                                 "on max-retries setting (default: 60000 = 60 seconds).");
+
     parser.addArgument(baseUrlArg);
     parser.addArgument(userBaseArg);
     parser.addArgument(groupBaseArg);
@@ -358,6 +414,10 @@ public class Scim2GroupMemberDestination extends SyncDestination
     parser.addArgument(proxyPasswordArg);
     parser.addArgument(proxyTypeArg);
     parser.addArgument(disableGroupMembershipLookupsArg);
+    parser.addArgument(maxRetriesArg);
+    parser.addArgument(retryDelayArg);
+    parser.addArgument(connectTimeoutArg);
+    parser.addArgument(readTimeoutArg);
   }
 
 
@@ -442,6 +502,21 @@ public class Scim2GroupMemberDestination extends SyncDestination
           "High-performance configuration that disables group membership lookups. " +
           "Always sends group membership operations without checking current state, " +
           "ideal for SCIM2 endpoints that don't efficiently support members.value filters.");
+
+    exampleMap.put(
+      Arrays.asList("base-url=https://unreliable-scim.example.com/scim/v2", 
+                    "user-base=/Users", "group-base=/Groups",
+                    "username=syncuser", "password=p@ssW0rd",
+                    "group-membership-attributes=memberOf",
+                    "username-lookup-attribute=uid",
+                    "max-retries=5",
+                    "retry-delay-ms=2000",
+                    "connect-timeout-ms=15000",
+                    "read-timeout-ms=45000"),
+          "Configuration optimized for unreliable networks or SCIM2 endpoints with " +
+          "intermittent issues. Increases retry attempts to 5 with 2-second initial delay " +
+          "(exponential backoff), and reduces timeouts for faster failure detection. " +
+          "Helps maintain synchronization even with transient network or server problems.");
 
     return exampleMap;
   }
@@ -571,6 +646,25 @@ public class Scim2GroupMemberDestination extends SyncDestination
     this.disableGroupMembershipLookups = (disableGroupMembershipLookupsArg != null && 
                                          disableGroupMembershipLookupsArg.isPresent());
 
+    // Parse retry and timeout configuration
+    StringArgument maxRetriesArg = (StringArgument)
+                              parser.getNamedArgument("max-retries");
+    StringArgument retryDelayArg = (StringArgument)
+                              parser.getNamedArgument("retry-delay-ms");
+    StringArgument connectTimeoutArg = (StringArgument)
+                              parser.getNamedArgument("connect-timeout-ms");
+    StringArgument readTimeoutArg = (StringArgument)
+                              parser.getNamedArgument("read-timeout-ms");
+
+    this.maxRetries = (maxRetriesArg != null && maxRetriesArg.getValue() != null) ? 
+                      Integer.parseInt(maxRetriesArg.getValue()) : 3;
+    this.retryDelayMs = (retryDelayArg != null && retryDelayArg.getValue() != null) ? 
+                        Integer.parseInt(retryDelayArg.getValue()) : 1000;
+    this.connectTimeoutMs = (connectTimeoutArg != null && connectTimeoutArg.getValue() != null) ? 
+                            Integer.parseInt(connectTimeoutArg.getValue()) : 30000;
+    this.readTimeoutMs = (readTimeoutArg != null && readTimeoutArg.getValue() != null) ? 
+                         Integer.parseInt(readTimeoutArg.getValue()) : 60000;
+
     // Parse comma-separated group membership attributes
     String groupMembershipAttrsStr = groupMembershipAttrsArg.getValue();
     this.groupMembershipAttributes = groupMembershipAttrsStr.split(",");
@@ -584,6 +678,10 @@ public class Scim2GroupMemberDestination extends SyncDestination
       // Apache HttpClient has full support for PATCH method without workarounds
       ClientConfig clientConfig = new ClientConfig();
       clientConfig.connectorProvider(new ApacheConnectorProvider());
+      
+      // Configure connection and read timeouts
+      clientConfig.property(ClientProperties.CONNECT_TIMEOUT, this.connectTimeoutMs);
+      clientConfig.property(ClientProperties.READ_TIMEOUT, this.readTimeoutMs);
       
       // Configure SSL/TLS settings
       SSLContext sslContext = createSSLContext();
@@ -631,7 +729,7 @@ public class Scim2GroupMemberDestination extends SyncDestination
       this.jaxrsClient = restClient;
       
       // Log successful initialization
-      System.out.println("✅ SCIM2 Group Membership Sync Destination initialized successfully!");
+      System.out.println("   SCIM2 Group Membership Sync Destination initialized successfully!");
       System.out.println("   Base URL: " + this.baseUrl);
       System.out.println("   HTTP Client: Apache HttpClient (native PATCH support)");
       System.out.println("   Authentication Type: " + this.authType);
@@ -662,6 +760,11 @@ public class Scim2GroupMemberDestination extends SyncDestination
       // Log group membership lookup configuration
       System.out.println("   Group Membership Lookups: " + 
                         (disableGroupMembershipLookups ? "DISABLED (always send operations)" : "ENABLED (check before operations)"));
+      
+      // Log retry and timeout configuration
+      System.out.println("   Retry Configuration: Max retries=" + maxRetries + 
+                        ", Initial delay=" + retryDelayMs + "ms (exponential backoff)");
+      System.out.println("   Timeout Configuration: Connect=" + connectTimeoutMs + "ms, Read=" + readTimeoutMs + "ms");
     }
     catch(Exception e)
     {
@@ -714,9 +817,11 @@ public class Scim2GroupMemberDestination extends SyncDestination
    * Return a full destination entry (in LDAP form) from the destination
    * endpoint, corresponding to the source {@link Entry} that is passed in.
    * <p>
-   * This method maps LDAP users to their corresponding SCIM2 users by looking up
-   * the username and finding the matching SCIM2 user. It returns a synthetic LDAP
-   * entry containing the username and SCIM2 user ID for use in standard synchronization mode.
+   * This method handles both user and group entries:
+   * - For users: Maps LDAP users to their corresponding SCIM2 users by looking up
+   *   the username and finding the matching SCIM2 user.
+   * - For groups: Maps LDAP groups to their corresponding SCIM2 groups by looking up
+   *   the group name. During resync operations, this enables accurate membership sync.
    * <p>
    * This method <b>must be thread safe</b>, as it will be called repeatedly and
    * concurrently by each of the Sync Pipe worker threads as they process
@@ -737,9 +842,32 @@ public class Scim2GroupMemberDestination extends SyncDestination
                                        final SyncOperation operation)
                                           throws EndpointException
   {
-    // Extract username from the mapped entry
-    String username = null;
+    // Log entry to fetchEntry with full entry details
+    operation.logInfo("fetchEntry called for DN: " + destEntryMappedFromSrc.getDN());
+    
+    if (serverContext.debugEnabled()) {
+      serverContext.debugInfo("fetchEntry - Full entry details: " + destEntryMappedFromSrc.toLDIFString());
+    }
+    
+    // Check if this is a group entry (has cn attribute and no username lookup attribute)
+    Attribute cnAttr = destEntryMappedFromSrc.getAttribute("cn");
     Attribute usernameAttr = destEntryMappedFromSrc.getAttribute(usernameLookupAttribute);
+    
+    operation.logInfo("fetchEntry - Entry analysis: cn=" + 
+                     (cnAttr != null ? cnAttr.getValue() : "null") + 
+                     ", " + usernameLookupAttribute + "=" + 
+                     (usernameAttr != null ? usernameAttr.getValue() : "null"));
+    
+    if (cnAttr != null && usernameAttr == null) {
+      // This is a group entry - handle group resync
+      operation.logInfo("fetchEntry - Detected GROUP entry, routing to fetchGroupEntry");
+      return fetchGroupEntry(destEntryMappedFromSrc, operation);
+    }
+    
+    operation.logInfo("fetchEntry - Detected USER entry, processing user lookup");
+    
+    // This is a user entry - original user processing logic
+    String username = null;
     
     if (usernameAttr != null && usernameAttr.getValue() != null) {
       username = usernameAttr.getValue();
@@ -773,6 +901,64 @@ public class Scim2GroupMemberDestination extends SyncDestination
     
     return Arrays.asList(syntheticEntry);
   }
+  
+  /**
+   * Fetches a group entry from the SCIM2 destination.
+   * Used during group resync operations to retrieve the current state of the group.
+   * 
+   * @param destEntryMappedFromSrc The mapped group entry from the source
+   * @param operation The sync operation for logging
+   * @return List containing the synthetic group entry, or empty list if not found
+   * @throws EndpointException If there's an error fetching the group
+   */
+  private List<Entry> fetchGroupEntry(final Entry destEntryMappedFromSrc, 
+      final SyncOperation operation) throws EndpointException {
+    
+    operation.logInfo("fetchGroupEntry - Starting group lookup for DN: " + destEntryMappedFromSrc.getDN());
+    
+    // Extract group name from cn attribute
+    String groupName = null;
+    Attribute cnAttr = destEntryMappedFromSrc.getAttribute("cn");
+    
+    if (cnAttr != null && cnAttr.getValue() != null) {
+      groupName = cnAttr.getValue();
+      operation.logInfo("fetchGroupEntry - Extracted group name: " + groupName);
+    } else {
+      operation.logInfo("fetchGroupEntry - ERROR: No group name found in cn attribute for entry: " + 
+                       destEntryMappedFromSrc.getDN());
+      if (serverContext.debugEnabled()) {
+        serverContext.debugInfo("fetchGroupEntry - Entry has no cn attribute, full entry: " + 
+                              destEntryMappedFromSrc.toLDIFString());
+      }
+      return Collections.emptyList();
+    }
+    
+    // Search for corresponding SCIM2 group
+    operation.logInfo("fetchGroupEntry - Searching for SCIM2 group with displayName: " + groupName);
+    String scim2GroupId = findScim2GroupId(groupName, operation);
+    
+    if (scim2GroupId == null) {
+      operation.logInfo("fetchGroupEntry - WARNING: No SCIM2 group found for group name: " + groupName + 
+                       " - Group will be created instead of modified");
+      return Collections.emptyList();
+    }
+    
+    operation.logInfo("fetchGroupEntry - SUCCESS: Found SCIM2 group ID: " + scim2GroupId + 
+                     " for group name: " + groupName);
+    
+    // Create a synthetic LDAP entry representing the SCIM2 group
+    Entry syntheticEntry = new Entry(destEntryMappedFromSrc.getDN());
+    syntheticEntry.addAttribute("cn", groupName);
+    syntheticEntry.addAttribute("scim2GroupId", scim2GroupId);
+    
+    if (serverContext.debugEnabled()) {
+      serverContext.debugInfo("fetchGroupEntry - Created synthetic entry: " + syntheticEntry.toLDIFString());
+    }
+    
+    operation.logInfo("fetchGroupEntry - Returning synthetic group entry with SCIM2 ID: " + scim2GroupId);
+    
+    return Arrays.asList(syntheticEntry);
+  }
 
 
 
@@ -780,10 +966,10 @@ public class Scim2GroupMemberDestination extends SyncDestination
    * Creates a full destination "entry", corresponding to the LDAP
    * {@link Entry} that is passed in.
    * <p>
-   * <b>Note:</b> This SCIM2 Group Membership destination does not support
-   * creating entries as it is designed specifically for group membership
-   * synchronization. Group membership changes are handled in the
-   * {@link #modifyEntry} method.
+   * <b>Note:</b> During resync operations, this method may be called when fetchEntry
+   * is skipped or returns no results. For group resync operations to work properly,
+   * the group MUST exist in SCIM2 destination and the sync pipe should be configured
+   * to use the --useExistingEntry option during resync.
    * <p>
    * This method <b>must be thread safe</b>, as it will be called repeatedly and
    * concurrently by the Sync Pipe worker threads as they process CREATE
@@ -801,24 +987,87 @@ public class Scim2GroupMemberDestination extends SyncDestination
                                        final SyncOperation operation)
                                            throws EndpointException
   {
+    operation.logInfo("createEntry called for DN: " + entryToCreate.getDN());
+    
+    if (serverContext.debugEnabled()) {
+      serverContext.debugInfo("createEntry - Full entry details: " + entryToCreate.toLDIFString());
+    }
+    
     if (shouldIgnore(entryToCreate, operation))
     {
+      operation.logInfo("createEntry - Entry is being ignored");
       return;
     }
     
+    // Check if this is a user entry - ignore user resync operations
+    Attribute usernameAttr = entryToCreate.getAttribute(usernameLookupAttribute);
+    Attribute cnAttr = entryToCreate.getAttribute("cn");
+    
+    operation.logInfo("createEntry - Entry analysis: cn=" + 
+                     (cnAttr != null ? cnAttr.getValue() : "null") + 
+                     ", " + usernameLookupAttribute + "=" + 
+                     (usernameAttr != null ? usernameAttr.getValue() : "null"));
+    
+    if (usernameAttr != null) {
+      operation.logInfo("createEntry - Ignoring user resync operation (createEntry) for user entry: " + 
+                       entryToCreate.getDN());
+      return;
+    }
+    
+    // Check if this is a group with members attribute (resync scenario)
+    Attribute membersAttr = entryToCreate.getAttribute("members");
+    if (cnAttr != null && membersAttr != null) {
+      operation.logInfo("createEntry - Group resync detected but fetchEntry was not called or returned no results");
+      operation.logInfo("createEntry - This typically happens when the sync pipe did not use --useExistingEntry option");
+      operation.logInfo("createEntry - Attempting to handle as modify operation instead...");
+      
+      // Try to handle this as a group resync operation
+      // First, check if the group exists in SCIM2
+      String groupName = cnAttr.getValue();
+      String scim2GroupId = findScim2GroupId(groupName, operation);
+      
+      if (scim2GroupId != null) {
+        operation.logInfo("createEntry - Found existing SCIM2 group: " + groupName + " (ID: " + scim2GroupId + ")");
+        operation.logInfo("createEntry - Handling as group resync/modify operation");
+        
+        // Create a synthetic entry with the scim2GroupId
+        Entry syntheticEntry = new Entry(entryToCreate.getDN());
+        syntheticEntry.addAttribute("cn", groupName);
+        syntheticEntry.addAttribute("scim2GroupId", scim2GroupId);
+        
+        // Create a REPLACE modification for the members attribute
+        List<Modification> modifications = new ArrayList<Modification>();
+        modifications.add(new Modification(ModificationType.REPLACE, "members", membersAttr.getValues()));
+        
+        // Call modifyEntry to process the group resync
+        modifyEntry(syntheticEntry, modifications, operation);
+        return;
+      } else {
+        operation.logInfo("createEntry - ERROR: Group does not exist in SCIM2: " + groupName);
+        operation.logInfo("createEntry - Groups must be created in SCIM2 before resync can update membership");
+        operation.logInfo("createEntry - Skipping group resync for: " + groupName);
+        return;
+      }
+    }
+    
     // This SCIM2 destination is designed for group membership synchronization only
-    // Entry creation is not supported
-    operation.logInfo("createEntry called but not supported by SCIM2 Group Membership destination for entry: " + 
-                     entryToCreate.getDN());
+    // Entry creation is not directly supported - groups are handled via modifyEntry
+    operation.logInfo("createEntry - WARNING: Called for entry: " + entryToCreate.getDN());
+    operation.logInfo("createEntry - TROUBLESHOOTING STEPS:");
+    operation.logInfo("createEntry - 1. Ensure the group exists in SCIM2 with matching displayName");
+    operation.logInfo("createEntry - 2. Run resync with: --useExistingEntry option");
+    operation.logInfo("createEntry - 3. Verify that fetchEntry is being called for existing entries");
   }
 
 
 
   /**
    * Modify an "entry" on the destination, corresponding to the LDAP
-   * {@link Entry} that is passed in. This method is responsible for
-   * detecting changes to group membership attributes and updating the
-   * corresponding SCIM2 groups by adding or removing users.
+   * {@link Entry} that is passed in. This method is responsible for:
+   * - For users: detecting changes to group membership attributes and updating
+   *   the corresponding SCIM2 groups by adding or removing users.
+   * - For groups: processing group resync operations by replacing the entire
+   *   membership list in the SCIM2 group.
    * <p>
    * This method <b>must be thread safe</b>, as it will be called repeatedly and
    * concurrently by the Sync Pipe worker threads as they process MODIFY
@@ -844,20 +1093,57 @@ public class Scim2GroupMemberDestination extends SyncDestination
                           final SyncOperation operation)
                                                  throws EndpointException
   {
+    operation.logInfo("modifyEntry called for DN: " + entryToModify.getDN() + 
+                     " with " + modsToApply.size() + " modifications");
+    
+    if (serverContext.debugEnabled()) {
+      serverContext.debugInfo("modifyEntry - Full entry: " + entryToModify.toLDIFString());
+      StringBuilder modsSummary = new StringBuilder("modifyEntry - Modifications:\n");
+      for (Modification mod : modsToApply) {
+        modsSummary.append("  ").append(mod.getModificationType())
+                   .append(" ").append(mod.getAttributeName())
+                   .append(": ").append(Arrays.toString(mod.getValues()))
+                   .append("\n");
+      }
+      serverContext.debugInfo(modsSummary.toString());
+    }
+    
     if (shouldIgnore(entryToModify, operation))
     {
+      operation.logInfo("modifyEntry - Entry is being ignored");
       return;
     }
 
-    // Handle both standard and notification synchronization modes:
+    // Check if this is a group entry (has scim2GroupId attribute)
+    Attribute scim2GroupIdAttr = entryToModify.getAttribute("scim2GroupId");
+    Attribute cnAttr = entryToModify.getAttribute("cn");
+    Attribute usernameAttr = entryToModify.getAttribute(usernameLookupAttribute);
+    
+    operation.logInfo("modifyEntry - Entry analysis: cn=" + 
+                     (cnAttr != null ? cnAttr.getValue() : "null") + 
+                     ", scim2GroupId=" + 
+                     (scim2GroupIdAttr != null ? scim2GroupIdAttr.getValue() : "null") +
+                     ", " + usernameLookupAttribute + "=" + 
+                     (usernameAttr != null ? usernameAttr.getValue() : "null"));
+    
+    if (scim2GroupIdAttr != null && scim2GroupIdAttr.getValue() != null) {
+      // This is a group entry - process group resync
+      operation.logInfo("modifyEntry - Detected GROUP entry with SCIM2 ID, routing to processGroupResync");
+      processGroupResync(entryToModify, modsToApply, operation);
+      return;
+    }
+    
+    operation.logInfo("modifyEntry - Processing as USER entry");
+
+    // Handle both standard and notification synchronization modes for users:
     // - In standard mode: entryToModify is the synthetic entry from fetchEntry with scim2UserId
     // - In notification mode: entryToModify is the mapped source entry, need to lookup scim2UserId
     String username = null;
     String scim2UserId = null;
     
-    Attribute usernameAttr = entryToModify.getAttribute(usernameLookupAttribute);
-    if (usernameAttr != null && usernameAttr.getValue() != null) {
-      username = usernameAttr.getValue();
+    Attribute userAttr = entryToModify.getAttribute(usernameLookupAttribute);
+    if (userAttr != null && userAttr.getValue() != null) {
+      username = userAttr.getValue();
     }
     
     // Try to get scim2UserId from synthetic entry (standard mode)
@@ -888,6 +1174,127 @@ public class Scim2GroupMemberDestination extends SyncDestination
     }
     
     operation.logInfo("Processed group membership changes for user: " + username + " (SCIM2 ID: " + scim2UserId + ")");
+  }
+  
+  /**
+   * Processes group resync operations by replacing the entire membership list
+   * in the SCIM2 group. This method reads the members attribute (containing user IDs)
+   * from the source group, searches for each user in SCIM2, and constructs a PUT
+   * operation to replace the destination group's members.
+   * 
+   * @param entryToModify The group entry being modified
+   * @param modsToApply The modifications to apply (should contain members attribute)
+   * @param operation The sync operation for logging
+   * @throws EndpointException If there's an error during the resync
+   */
+  private void processGroupResync(final Entry entryToModify, 
+      final List<Modification> modsToApply, final SyncOperation operation) 
+      throws EndpointException {
+    
+    // Get the SCIM2 group ID
+    String scim2GroupId = null;
+    Attribute scim2GroupIdAttr = entryToModify.getAttribute("scim2GroupId");
+    if (scim2GroupIdAttr != null && scim2GroupIdAttr.getValue() != null) {
+      scim2GroupId = scim2GroupIdAttr.getValue();
+    }
+    
+    // Get the group name for logging
+    String groupName = null;
+    Attribute cnAttr = entryToModify.getAttribute("cn");
+    if (cnAttr != null && cnAttr.getValue() != null) {
+      groupName = cnAttr.getValue();
+    }
+    
+    if (scim2GroupId == null) {
+      operation.logInfo("Skipping group resync - missing SCIM2 group ID for entry: " + entryToModify.getDN());
+      return;
+    }
+    
+    operation.logInfo("Processing group resync for group: " + groupName + " (SCIM2 ID: " + scim2GroupId + ")");
+    
+    // Find the members modification
+    Modification membersModification = null;
+    for (Modification mod : modsToApply) {
+      if ("members".equalsIgnoreCase(mod.getAttributeName())) {
+        membersModification = mod;
+        break;
+      }
+    }
+    
+    if (membersModification == null) {
+      operation.logInfo("No members modification found for group resync - skipping");
+      return;
+    }
+    
+    // Get the member user IDs (uid values from source)
+    String[] memberUserIds = membersModification.getValues();
+    if (memberUserIds == null || memberUserIds.length == 0) {
+      operation.logInfo("No member user IDs found - clearing group membership for group: " + groupName);
+      memberUserIds = new String[0];
+    } else {
+      operation.logInfo("Found " + memberUserIds.length + " member user IDs for group resync");
+    }
+    
+    // Build list of SCIM2 user IDs by searching for each uid
+    List<Member> scim2Members = new ArrayList<Member>();
+    for (String userId : memberUserIds) {
+      if (userId == null || userId.trim().isEmpty()) {
+        continue;
+      }
+      
+      userId = userId.trim();
+      String scim2UserId = findScim2UserId(userId, operation);
+      
+      if (scim2UserId != null) {
+        Member member = new Member();
+        member.setValue(scim2UserId);
+        member.setRef(URI.create(baseUrl + userBasePath + "/" + scim2UserId));
+        scim2Members.add(member);
+        operation.logInfo("Mapped user ID " + userId + " to SCIM2 user ID: " + scim2UserId);
+      } else {
+        operation.logInfo("Warning: Could not find SCIM2 user for user ID: " + userId);
+      }
+    }
+    
+    operation.logInfo("Mapped " + scim2Members.size() + " of " + memberUserIds.length + 
+                     " users to SCIM2 - updating group: " + groupName);
+    
+    // Perform PUT operation to replace group members
+    try {
+      // Retrieve the existing group to get current state
+      GroupResource group = scimService.retrieve(groupBasePath, scim2GroupId, GroupResource.class);
+      
+      // Replace the members list
+      group.setMembers(scim2Members);
+      
+      // Strip read-only attributes
+      stripReadOnlyAttributes(group);
+      
+      // Use direct JAX-RS client to PUT without relying on meta.location
+      String putUrl = baseUrl + groupBasePath + "/" + scim2GroupId;
+      operation.logInfo("Executing PUT to URL: " + putUrl);
+      
+      WebTarget target = jaxrsClient.target(putUrl);
+      Response response = target.request("application/scim+json")
+          .put(Entity.entity(group, "application/scim+json"));
+      
+      if (response.getStatus() >= 200 && response.getStatus() < 300) {
+        operation.logInfo("Successfully updated group membership for group: " + groupName + 
+                         " (SCIM2 ID: " + scim2GroupId + ") with " + scim2Members.size() + " members");
+      } else {
+        String errorBody = response.hasEntity() ? response.readEntity(String.class) : "No response body";
+        throw new RuntimeException("PUT request failed with status: " + response.getStatus() + 
+                                 " - " + errorBody);
+      }
+      response.close();
+      
+    } catch (ScimException e) {
+      operation.logInfo("Error updating group membership for group " + groupName + ": " + e.getMessage());
+      throw new RuntimeException("Error updating group membership", e);
+    } catch (Exception e) {
+      operation.logInfo("Error updating group membership for group " + groupName + ": " + e.getMessage());
+      throw new RuntimeException("Error updating group membership", e);
+    }
   }
 
   /**
@@ -1265,6 +1672,96 @@ public class Scim2GroupMemberDestination extends SyncDestination
   }
 
   /**
+   * Functional interface for operations that can be retried.
+   * Used by executeWithRetry to wrap SCIM2 API calls with retry logic.
+   * 
+   * @param <T> The return type of the operation
+   */
+  @FunctionalInterface
+  private interface RetryableOperation<T> {
+    /**
+     * Executes the operation.
+     * 
+     * @return The result of the operation
+     * @throws Exception if the operation fails
+     */
+    T execute() throws Exception;
+  }
+
+  /**
+   * Executes a SCIM2 operation with automatic retry and exponential backoff.
+   * This method wraps SCIM2 API calls to handle transient network failures,
+   * timeouts, and temporary server issues.
+   * 
+   * Features:
+   * - Configurable maximum retry attempts
+   * - Exponential backoff between retries (delay doubles each time)
+   * - Detailed logging of retry attempts
+   * - Preserves interrupt status for thread management
+   * 
+   * @param <T> The return type of the operation
+   * @param operationName Human-readable name for logging (e.g., "Find SCIM2 user 'jdoe'")
+   * @param operation The sync operation for logging
+   * @param retryableOp The operation to execute with retry logic
+   * @return The result of the successful operation
+   * @throws EndpointException if the operation fails after all retry attempts
+   */
+  private <T> T executeWithRetry(final String operationName, 
+      final SyncOperation operation, 
+      final RetryableOperation<T> retryableOp) throws EndpointException {
+    
+    int attempt = 0;
+    Exception lastException = null;
+    long currentDelayMs = retryDelayMs;
+    
+    while (attempt < maxRetries) {
+      try {
+        // Attempt the operation
+        T result = retryableOp.execute();
+        
+        // Log success if this wasn't the first attempt
+        if (attempt > 0) {
+          operation.logInfo(operationName + " succeeded on retry attempt " + (attempt + 1));
+        }
+        
+        return result;
+        
+      } catch (Exception e) {
+        lastException = e;
+        attempt++;
+        
+        // If we haven't exhausted retries, wait and try again
+        if (attempt < maxRetries) {
+          operation.logInfo(operationName + " failed (attempt " + attempt + 
+                           " of " + maxRetries + "): " + e.getClass().getSimpleName() + 
+                           " - " + e.getMessage() + 
+                           " - Retrying in " + currentDelayMs + "ms with exponential backoff");
+          
+          try {
+            Thread.sleep(currentDelayMs);
+          } catch (InterruptedException ie) {
+            // Preserve interrupt status
+            Thread.currentThread().interrupt();
+            operation.logInfo(operationName + " retry interrupted - aborting retries");
+            throw new RuntimeException(operationName + " interrupted during retry", ie);
+          }
+          
+          // Exponential backoff: double the delay for next retry
+          currentDelayMs *= 2;
+        } else {
+          // All retries exhausted
+          operation.logInfo(operationName + " FAILED after " + maxRetries + 
+                           " attempts: " + lastException.getClass().getSimpleName() + 
+                           " - " + lastException.getMessage());
+        }
+      }
+    }
+    
+    // All retries exhausted, throw the last exception
+    throw new RuntimeException(operationName + " failed after " + maxRetries + " retry attempts", lastException);
+  }
+
+  /**
    * Extracts the username from notification mode entry or changelog entry.
    * In notification mode, we try multiple approaches to get the username.
    * 
@@ -1451,13 +1948,15 @@ public class Scim2GroupMemberDestination extends SyncDestination
    */
   protected String findScim2UserId(final String username, final SyncOperation operation) 
       throws EndpointException {
-    try {
-      // Check if SCIM service is initialized
-      if (scimService == null) {
-        operation.logInfo("SCIM service not initialized - cannot search for user: " + username);
-        return null;
-      }
-      
+    
+    // Check if SCIM service is initialized before attempting operation
+    if (scimService == null) {
+      operation.logInfo("SCIM service not initialized - cannot search for user: " + username);
+      return null;
+    }
+    
+    // Wrap the SCIM2 search operation with retry logic
+    return executeWithRetry("Find SCIM2 user '" + username + "'", operation, () -> {
       // Search for SCIM2 user using Filter
       Filter filter = Filter.eq("userName", username);
       
@@ -1490,14 +1989,7 @@ public class Scim2GroupMemberDestination extends SyncDestination
         operation.logInfo("No SCIM2 user found for username: " + username);
         return null;
       }
-      
-    } catch (ScimException e) {
-      operation.logInfo("Error searching for SCIM2 user: " + username + " - " + e.getMessage());
-      throw new RuntimeException("Error searching for SCIM2 user: " + username, e);
-    } catch (Exception e) {
-      operation.logInfo("Error searching for SCIM2 user: " + username + " - " + e.getMessage());
-      throw new RuntimeException("Error searching for SCIM2 user: " + username, e);
-    }
+    });
   }
 
   /**
@@ -1510,53 +2002,70 @@ public class Scim2GroupMemberDestination extends SyncDestination
    */
   protected String findScim2GroupId(final String groupName, final SyncOperation operation) 
       throws EndpointException {
-    try {
-      // Check if SCIM service is initialized
-      if (scimService == null) {
-        operation.logInfo("SCIM service not initialized - cannot search for group: " + groupName);
-        return null;
-      }
-      
+    
+    operation.logInfo("findScim2GroupId - Searching for SCIM2 group with displayName: '" + groupName + "'");
+    
+    // Check if SCIM service is initialized before attempting operation
+    if (scimService == null) {
+      operation.logInfo("findScim2GroupId - ERROR: SCIM service not initialized - cannot search for group: " + groupName);
+      return null;
+    }
+    
+    // Wrap the SCIM2 search operation with retry logic
+    return executeWithRetry("Find SCIM2 group '" + groupName + "'", operation, () -> {
       // Search for SCIM2 group using Filter
       Filter filter = Filter.eq("displayName", groupName);
       
+      operation.logInfo("findScim2GroupId - Executing SCIM2 search: base=" + groupBasePath + 
+                       ", filter=" + filter.toString());
+      
       // Debug logging for request
       if (serverContext.debugEnabled()) {
-        serverContext.debugInfo("SCIM2 Group Search Request - Base Path: " + groupBasePath + 
+        serverContext.debugInfo("findScim2GroupId - SCIM2 Group Search Request - Base Path: " + groupBasePath + 
                               ", Filter: " + filter.toString() + 
-                              ", Group Name: " + groupName);
+                              ", Group Name: " + groupName +
+                              ", Attributes: id,displayName (optimized - excludes members)" +
+                              ", Full URL: " + baseUrl + groupBasePath);
       }
       
       ListResponse<GroupResource> searchResponse =
         scimService.searchRequest(groupBasePath)
           .filter(filter.toString())
+          .attributes("id", "displayName") // Only request essential attributes, avoid large members list
           .invoke(GroupResource.class);
+      
+      operation.logInfo("findScim2GroupId - Search completed: totalResults=" + searchResponse.getTotalResults() +
+                       ", resourcesReturned=" + (searchResponse.getResources() != null ? searchResponse.getResources().size() : 0));
       
       // Debug logging for response
       if (serverContext.debugEnabled()) {
-        serverContext.debugInfo("SCIM2 Group Search Response - Group Name: " + groupName + 
+        serverContext.debugInfo("findScim2GroupId - SCIM2 Group Search Response - Group Name: " + groupName + 
                               ", Total Results: " + searchResponse.getTotalResults() + 
                               ", Resources Count: " + 
                               (searchResponse.getResources() != null ? searchResponse.getResources().size() : 0));
+        
+        if (searchResponse.getResources() != null && !searchResponse.getResources().isEmpty()) {
+          for (int i = 0; i < searchResponse.getResources().size(); i++) {
+            GroupResource gr = searchResponse.getResources().get(i);
+            serverContext.debugInfo("findScim2GroupId - Result[" + i + "]: id=" + gr.getId() + 
+                                  ", displayName=" + gr.getDisplayName());
+          }
+        }
       }
       
       if (searchResponse.getTotalResults() > 0) {
         GroupResource group = searchResponse.getResources().get(0);
         String groupId = group.getId();
-        operation.logInfo("Found SCIM2 group ID: " + groupId + " for group name: " + groupName);
+        operation.logInfo("findScim2GroupId - SUCCESS: Found SCIM2 group ID: " + groupId + 
+                         " with displayName: " + group.getDisplayName() + 
+                         " for search name: " + groupName);
         return groupId;
       } else {
-        operation.logInfo("No SCIM2 group found for group name: " + groupName);
+        operation.logInfo("findScim2GroupId - WARNING: No SCIM2 group found for displayName: '" + groupName + "'" +
+                         " - Check if group exists in SCIM2 and displayName matches exactly (case-sensitive)");
         return null;
       }
-      
-    } catch (ScimException e) {
-      operation.logInfo("Error searching for SCIM2 group: " + groupName + " - " + e.getMessage());
-      throw new RuntimeException("Error searching for SCIM2 group: " + groupName, e);
-    } catch (Exception e) {
-      operation.logInfo("Error searching for SCIM2 group: " + groupName + " - " + e.getMessage());
-      throw new RuntimeException("Error searching for SCIM2 group: " + groupName, e);
-    }
+    });
   }
 
   /**
@@ -1571,20 +2080,22 @@ public class Scim2GroupMemberDestination extends SyncDestination
    */
   protected void addUserToScim2Group(final String groupId, final String userId, 
       final SyncOperation operation) throws EndpointException {
-    try {
-      // Check if SCIM service is initialized
-      if (scimService == null) {
-        operation.logInfo("SCIM service not initialized - cannot add user to group");
-        return;
-      }
-      
-      // Check if user is already a member to avoid unnecessary API calls
-      // But if lookups are disabled, we always attempt the add operation
-      if (!disableGroupMembershipLookups && isUserMemberOfGroup(groupId, userId, operation)) {
-        operation.logInfo("User " + userId + " is already a member of group " + groupId);
-        return;
-      }
-      
+    
+    // Check if SCIM service is initialized before attempting operation
+    if (scimService == null) {
+      operation.logInfo("SCIM service not initialized - cannot add user to group");
+      return;
+    }
+    
+    // Check if user is already a member to avoid unnecessary API calls
+    // But if lookups are disabled, we always attempt the add operation
+    if (!disableGroupMembershipLookups && isUserMemberOfGroup(groupId, userId, operation)) {
+      operation.logInfo("User " + userId + " is already a member of group " + groupId);
+      return;
+    }
+    
+    // Wrap the SCIM2 add operation with retry logic
+    executeWithRetry("Add user " + userId + " to SCIM2 group " + groupId, operation, () -> {
       if ("put".equalsIgnoreCase(updateMethod)) {
         // PUT method: retrieve, modify, and replace entire group
         addUserToScim2GroupViaPut(groupId, userId, operation);
@@ -1592,14 +2103,8 @@ public class Scim2GroupMemberDestination extends SyncDestination
         // PATCH method: recommended approach per RFC 7644
         addUserToScim2GroupViaPatch(groupId, userId, operation);
       }
-      
-    } catch (ScimException e) {
-      operation.logInfo("Error adding user " + userId + " to SCIM2 group " + groupId + " - " + e.getMessage());
-      throw new RuntimeException("Error adding user to SCIM2 group", e);
-    } catch (Exception e) {
-      operation.logInfo("Error adding user " + userId + " to SCIM2 group " + groupId + " - " + e.getMessage());
-      throw new RuntimeException("Error adding user to SCIM2 group", e);
-    }
+      return null; // Void operation, return null
+    });
   }
 
   /**
@@ -1713,20 +2218,22 @@ public class Scim2GroupMemberDestination extends SyncDestination
    */
   protected void removeUserFromScim2Group(final String groupId, final String userId, 
       final SyncOperation operation) throws EndpointException {
-    try {
-      // Check if SCIM service is initialized
-      if (scimService == null) {
-        operation.logInfo("SCIM service not initialized - cannot remove user from group");
-        return;
-      }
-      
-      // Check if user is actually a member to avoid unnecessary API calls
-      // But if lookups are disabled, we always attempt the remove operation
-      if (!disableGroupMembershipLookups && !isUserMemberOfGroup(groupId, userId, operation)) {
-        operation.logInfo("User " + userId + " is not a member of group " + groupId);
-        return;
-      }
-      
+    
+    // Check if SCIM service is initialized before attempting operation
+    if (scimService == null) {
+      operation.logInfo("SCIM service not initialized - cannot remove user from group");
+      return;
+    }
+    
+    // Check if user is actually a member to avoid unnecessary API calls
+    // But if lookups are disabled, we always attempt the remove operation
+    if (!disableGroupMembershipLookups && !isUserMemberOfGroup(groupId, userId, operation)) {
+      operation.logInfo("User " + userId + " is not a member of group " + groupId);
+      return;
+    }
+    
+    // Wrap the SCIM2 remove operation with retry logic
+    executeWithRetry("Remove user " + userId + " from SCIM2 group " + groupId, operation, () -> {
       if ("put".equalsIgnoreCase(updateMethod)) {
         // PUT method: retrieve, modify, and replace entire group
         removeUserFromScim2GroupViaPut(groupId, userId, operation);
@@ -1734,14 +2241,8 @@ public class Scim2GroupMemberDestination extends SyncDestination
         // PATCH method: recommended approach per RFC 7644
         removeUserFromScim2GroupViaPatch(groupId, userId, operation);
       }
-      
-    } catch (ScimException e) {
-      operation.logInfo("Error removing user " + userId + " from SCIM2 group " + groupId + " - " + e.getMessage());
-      throw new RuntimeException("Error removing user from SCIM2 group", e);
-    } catch (Exception e) {
-      operation.logInfo("Error removing user " + userId + " from SCIM2 group " + groupId + " - " + e.getMessage());
-      throw new RuntimeException("Error removing user from SCIM2 group", e);
-    }
+      return null; // Void operation, return null
+    });
   }
 
   /**
