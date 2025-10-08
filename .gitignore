@@ -1,0 +1,12 @@
+.github/
+.vscode/
+ant/
+build/
+config/
+docs/
+lib/
+sdk-libs/
+build.bat
+build.sh
+build.xml
+LICENSE

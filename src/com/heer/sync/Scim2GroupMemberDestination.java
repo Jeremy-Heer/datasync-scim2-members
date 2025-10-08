@@ -55,6 +55,15 @@ import com.unboundid.scim2.common.types.Member;
 import com.unboundid.scim2.common.messages.ListResponse;
 import com.unboundid.scim2.common.filters.Filter;
 import com.unboundid.scim2.common.exceptions.ScimException;
+import com.unboundid.scim2.common.utils.JsonUtils;
+import com.unboundid.scim2.common.messages.PatchRequest;
+import com.unboundid.scim2.common.messages.PatchOperation;
+import com.unboundid.scim2.common.Path;
+
+// Jackson imports for JSON serialization
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.fasterxml.jackson.databind.JsonNode;
 
 // JAX-RS client imports - using Jakarta EE (available from Ping Data Sync server lib directory)
 import jakarta.ws.rs.client.Client;
@@ -142,6 +151,10 @@ import javax.net.ssl.X509TrustManager;
  */
 public class Scim2GroupMemberDestination extends SyncDestination
 {
+
+  // Pre-configured ObjectMapper from SCIM2 SDK that properly handles null values
+  // and other SCIM-specific serialization requirements
+  private static final ObjectMapper SCIM_OBJECT_MAPPER = JsonUtils.createObjectMapper();
 
   // The general configuration for this Sync Destination
   private volatile SyncDestinationConfig config;
@@ -1274,9 +1287,14 @@ public class Scim2GroupMemberDestination extends SyncDestination
       String putUrl = baseUrl + groupBasePath + "/" + scim2GroupId;
       operation.logInfo("Executing PUT to URL: " + putUrl);
       
+      // Serialize group using SCIM2 SDK's pre-configured ObjectMapper
+      // This excludes null values and applies other SCIM-specific serialization settings
+      // per the SCIM2 SDK documentation: https://github.com/pingidentity/scim2/wiki/Common-Problems-and-FAQ
+      String groupJson = SCIM_OBJECT_MAPPER.writeValueAsString(group);
+      
       WebTarget target = jaxrsClient.target(putUrl);
       Response response = target.request("application/scim+json")
-          .put(Entity.entity(group, "application/scim+json"));
+          .put(Entity.entity(groupJson, "application/scim+json"));
       
       if (response.getStatus() >= 200 && response.getStatus() < 300) {
         operation.logInfo("Successfully updated group membership for group: " + groupName + 
@@ -2109,22 +2127,23 @@ public class Scim2GroupMemberDestination extends SyncDestination
 
   /**
    * Adds a user to a SCIM2 group using PATCH operation (recommended approach).
-   * Uses direct JAX-RS client to create RFC 7644 compliant PATCH requests without extra fields.
+   * Uses SCIM2 SDK's PatchOperation POJOs with pre-configured ObjectMapper to ensure
+   * RFC 7644 compliance and proper null value handling.
    */
   private void addUserToScim2GroupViaPatch(final String groupId, final String userId, 
       final SyncOperation operation) throws ScimException {
-    // Create manual PATCH request using JAX-RS client to ensure RFC 7644 compliance
-    String patchJson = createAddMemberPatchJson(userId);
-    
-    // Debug logging for request
-    if (serverContext.debugEnabled()) {
-      serverContext.debugInfo("SCIM2 Group PATCH Add Request - Group ID: " + groupId + 
-                            ", User ID: " + userId + 
-                            ", URL: " + baseUrl + groupBasePath + "/" + groupId + 
-                            ", Request Body: " + patchJson);
-    }
-    
     try {
+      // Create PATCH request using SCIM2 SDK POJOs with proper ObjectMapper
+      String patchJson = createAddMemberPatchJson(userId);
+      
+      // Debug logging for request
+      if (serverContext.debugEnabled()) {
+        serverContext.debugInfo("SCIM2 Group PATCH Add Request - Group ID: " + groupId + 
+                              ", User ID: " + userId + 
+                              ", URL: " + baseUrl + groupBasePath + "/" + groupId + 
+                              ", Request Body: " + patchJson);
+      }
+      
       WebTarget target = jaxrsClient.target(baseUrl + groupBasePath + "/" + groupId);
       Response response = target.request("application/scim+json")
           .method("PATCH", Entity.entity(patchJson, "application/scim+json"));
@@ -2143,7 +2162,8 @@ public class Scim2GroupMemberDestination extends SyncDestination
       }
       
       if (response.getStatus() >= 200 && response.getStatus() < 300) {
-        operation.logInfo("Added user " + userId + " to SCIM2 group " + groupId + " via PATCH (RFC 7644 compliant)");
+        operation.logInfo("Added user " + userId + " to SCIM2 group " + groupId + 
+                         " via PATCH (RFC 7644 compliant, null values excluded)");
       } else {
         String errorBody = response.hasEntity() ? response.readEntity(String.class) : "No response body";
         throw new RuntimeException("PATCH request failed with status: " + response.getStatus() + 
@@ -2247,22 +2267,23 @@ public class Scim2GroupMemberDestination extends SyncDestination
 
   /**
    * Removes a user from a SCIM2 group using PATCH operation (recommended approach).
-   * Uses direct JAX-RS client to create RFC 7644 compliant PATCH requests without extra fields.
+   * Uses SCIM2 SDK's PatchOperation POJOs with pre-configured ObjectMapper to ensure
+   * RFC 7644 compliance and proper null value handling.
    */
   private void removeUserFromScim2GroupViaPatch(final String groupId, final String userId, 
       final SyncOperation operation) throws ScimException {
-    // Create manual PATCH request using JAX-RS client to ensure RFC 7644 compliance
-    String patchJson = createRemoveMemberPatchJson(userId);
-    
-    // Debug logging for request
-    if (serverContext.debugEnabled()) {
-      serverContext.debugInfo("SCIM2 Group PATCH Remove Request - Group ID: " + groupId + 
-                            ", User ID: " + userId + 
-                            ", URL: " + baseUrl + groupBasePath + "/" + groupId + 
-                            ", Request Body: " + patchJson);
-    }
-    
     try {
+      // Create PATCH request using SCIM2 SDK POJOs with proper ObjectMapper
+      String patchJson = createRemoveMemberPatchJson(userId);
+      
+      // Debug logging for request
+      if (serverContext.debugEnabled()) {
+        serverContext.debugInfo("SCIM2 Group PATCH Remove Request - Group ID: " + groupId + 
+                              ", User ID: " + userId + 
+                              ", URL: " + baseUrl + groupBasePath + "/" + groupId + 
+                              ", Request Body: " + patchJson);
+      }
+      
       WebTarget target = jaxrsClient.target(baseUrl + groupBasePath + "/" + groupId);
       Response response = target.request("application/scim+json")
           .method("PATCH", Entity.entity(patchJson, "application/scim+json"));
@@ -2281,7 +2302,8 @@ public class Scim2GroupMemberDestination extends SyncDestination
       }
       
       if (response.getStatus() >= 200 && response.getStatus() < 300) {
-        operation.logInfo("Removed user " + userId + " from SCIM2 group " + groupId + " via PATCH (RFC 7644 compliant)");
+        operation.logInfo("Removed user " + userId + " from SCIM2 group " + groupId + 
+                         " via PATCH (RFC 7644 compliant, null values excluded)");
       } else {
         String errorBody = response.hasEntity() ? response.readEntity(String.class) : "No response body";
         throw new RuntimeException("PATCH request failed with status: " + response.getStatus() + 
@@ -2517,37 +2539,47 @@ public class Scim2GroupMemberDestination extends SyncDestination
 
   /**
    * Creates a proper RFC 7644 compliant PATCH JSON for adding a member to a group.
-   * This method ensures only the required fields (schemas and Operations) are included.
+   * Uses SCIM2 SDK's PatchOperation and ObjectMapper to ensure proper serialization
+   * with null values excluded per SCIM2 best practices.
    */
-  private String createAddMemberPatchJson(final String userId) {
-    StringBuilder json = new StringBuilder();
-    json.append("{");
-    json.append("\"schemas\":[\"urn:ietf:params:scim:api:messages:2.0:PatchOp\"],");
-    json.append("\"Operations\":[{");
-    json.append("\"op\":\"add\",");
-    json.append("\"path\":\"members\",");
-    json.append("\"value\":[{");
-    json.append("\"value\":\"").append(userId).append("\",");
-    json.append("\"$ref\":\"").append(baseUrl).append(userBasePath).append("/").append(userId).append("\"");
-    json.append("}]");
-    json.append("}]");
-    json.append("}");
-    return json.toString();
+  private String createAddMemberPatchJson(final String userId) throws Exception {
+    // Create a Member object with proper structure
+    Member member = new Member();
+    member.setValue(userId);
+    member.setRef(URI.create(baseUrl + userBasePath + "/" + userId));
+    
+    // Convert Member to JsonNode using SCIM SDK's pre-configured ObjectMapper
+    // This ensures null values are excluded
+    JsonNode memberNode = JsonUtils.valueToNode(member);
+    
+    // Create a JsonNode array containing the member
+    JsonNode membersArrayNode = SCIM_OBJECT_MAPPER.createArrayNode().add(memberNode);
+    
+    // Create PatchOperation using SDK's factory method
+    PatchOperation addOperation = PatchOperation.add("members", membersArrayNode);
+    
+    // Create PatchRequest with the operation
+    PatchRequest patchRequest = new PatchRequest(addOperation);
+    
+    // Serialize to JSON using SCIM SDK's ObjectMapper to exclude null values
+    return SCIM_OBJECT_MAPPER.writeValueAsString(patchRequest);
   }
 
   /**
    * Creates a proper RFC 7644 compliant PATCH JSON for removing a member from a group.
-   * This method ensures only the required fields (schemas and Operations) are included.
+   * Uses SCIM2 SDK's PatchOperation and ObjectMapper to ensure proper serialization
+   * with null values excluded per SCIM2 best practices.
    */
-  private String createRemoveMemberPatchJson(final String userId) {
-    StringBuilder json = new StringBuilder();
-    json.append("{");
-    json.append("\"schemas\":[\"urn:ietf:params:scim:api:messages:2.0:PatchOp\"],");
-    json.append("\"Operations\":[{");
-    json.append("\"op\":\"remove\",");
-    json.append("\"path\":\"members[value eq \\\"").append(userId).append("\\\"]\"");
-    json.append("}]");
-    json.append("}");
-    return json.toString();
+  private String createRemoveMemberPatchJson(final String userId) throws Exception {
+    // Create PatchOperation using SDK's factory method with filter path
+    // Path format: members[value eq "userId"]
+    Path removePath = Path.fromString("members[value eq \"" + userId + "\"]");
+    PatchOperation removeOperation = PatchOperation.remove(removePath);
+    
+    // Create PatchRequest with the operation
+    PatchRequest patchRequest = new PatchRequest(removeOperation);
+    
+    // Serialize to JSON using SCIM SDK's ObjectMapper to exclude null values
+    return SCIM_OBJECT_MAPPER.writeValueAsString(patchRequest);
   }
 }
