@@ -84,6 +84,11 @@ import com.unboundid.util.args.StringArgument;
  *   <LI>user-id-attribute -- The LDAP attribute on user entries that contains the
  *                            unique user ID (e.g., uid, sAMAccountName). This value
  *                            will be extracted and added to the members attribute.</LI>
+ *   <LI>group-filter -- (Optional) An LDAP filter to determine which dynamic groups
+ *                       should have their membership expanded. If not specified, all
+ *                       groups with memberURL attributes will be processed. This can
+ *                       significantly improve performance by limiting expensive member
+ *                       lookups to relevant groups only.</LI>
  * </UL>
  * 
  * <p>The base DN for user searches is extracted from the memberURL attribute in the
@@ -94,6 +99,7 @@ public class LDAPSyncSourcePluginScim2GroupMembers
 {
 
   private static final String ARG_NAME_USER_ID_ATTRIBUTE = "user-id-attribute";
+  private static final String ARG_NAME_GROUP_FILTER = "group-filter";
 
   // The server context for the server in which this extension is running.
   private SyncServerContext serverContext;
@@ -105,6 +111,9 @@ public class LDAPSyncSourcePluginScim2GroupMembers
 
   // The LDAP attribute on user entries containing the unique user ID (e.g., uid)
   private String userIdAttribute;
+  
+  // Optional LDAP filter to determine which groups should have membership expanded
+  private Filter groupFilter;
 
   /**
    * Retrieves a human-readable name for this extension.
@@ -180,6 +189,21 @@ public class LDAPSyncSourcePluginScim2GroupMembers
     arg.setValueRegex(Pattern.compile("^[a-zA-Z][a-zA-Z0-9\\\\-]*$"),
                       "A valid attribute name is required.");
     parser.addArgument(arg);
+
+    // Add an argument for the optional group filter
+    StringArgument groupFilterArg = new StringArgument(
+         null,  // shortIdentifier
+         ARG_NAME_GROUP_FILTER,  // longIdentifier
+         false,  // required
+         1,  // maxOccurrences
+         "{filter}",  // placeholder
+         "An optional LDAP filter to determine which dynamic groups should have " +
+         "their membership expanded. If not specified, all groups with memberURL " +
+         "attributes will be processed. Examples: '(cn=scim-*)' to process only " +
+         "groups starting with 'scim-', or '(description=*sync*)' to process " +
+         "groups with 'sync' in their description. This can significantly improve " +
+         "performance by limiting expensive member lookups to relevant groups only.");
+    parser.addArgument(groupFilterArg);
   }
 
 
@@ -292,6 +316,26 @@ public class LDAPSyncSourcePluginScim2GroupMembers
     {
       this.userIdAttribute = ((StringArgument)parser.getNamedArgument(
             ARG_NAME_USER_ID_ATTRIBUTE)).getValue();
+      
+      StringArgument groupFilterArg = (StringArgument)parser.getNamedArgument(
+            ARG_NAME_GROUP_FILTER);
+      if (groupFilterArg != null && groupFilterArg.isPresent())
+      {
+        try
+        {
+          this.groupFilter = Filter.create(groupFilterArg.getValue());
+        }
+        catch (LDAPException e)
+        {
+          // This shouldn't happen due to argument validation, but handle it gracefully
+          serverContext.debugError("Invalid group filter: " + e.getMessage());
+          this.groupFilter = null;
+        }
+      }
+      else
+      {
+        this.groupFilter = null;
+      }
     }
     finally
     {
@@ -315,7 +359,7 @@ public class LDAPSyncSourcePluginScim2GroupMembers
   public Map<List<String>, String> getExamplesArgumentSets()
   {
     final LinkedHashMap<List<String>,String> exampleMap =
-         new LinkedHashMap<List<String>,String>(1);
+         new LinkedHashMap<List<String>,String>(2);
 
     exampleMap.put(
          Arrays.asList(
@@ -324,6 +368,15 @@ public class LDAPSyncSourcePluginScim2GroupMembers
          "extracting uid values from matching user entries and constructing a " +
          "members attribute for synchronization to SCIM2 destination. " +
          "The base DN for user searches is extracted from the memberURL in each group.");
+
+    exampleMap.put(
+         Arrays.asList(
+              ARG_NAME_USER_ID_ATTRIBUTE + "=uid",
+              ARG_NAME_GROUP_FILTER + "=(cn=scim-*)"),
+         "Same as the first example, but only processes dynamic groups whose cn " +
+         "attribute starts with 'scim-'. This significantly improves performance by " +
+         "limiting expensive member lookups to only the groups that need to be " +
+         "synchronized to SCIM2.");
 
     return exampleMap;
   }
@@ -409,6 +462,25 @@ public class LDAPSyncSourcePluginScim2GroupMembers
         serverContext.debugInfo("Entry " + entry.getDN() + " does not have " +
             "memberURL attribute - not a dynamic group");
         return PostStepResult.CONTINUE;
+      }
+
+      // Check if this group matches the configured filter (if specified)
+      if (groupFilter != null)
+      {
+        try
+        {
+          if (!groupFilter.matchesEntry(entry))
+          {
+            serverContext.debugInfo("Entry " + entry.getDN() + 
+                " does not match group filter - skipping member expansion");
+            return PostStepResult.CONTINUE;
+          }
+        }
+        catch (LDAPException e)
+        {
+          operation.logInfo("Error evaluating group filter for " + entry.getDN() + 
+              ": " + e.getMessage() + " - processing group anyway");
+        }
       }
 
       operation.logInfo("Processing dynamic group: " + entry.getDN() + 
@@ -537,6 +609,8 @@ public class LDAPSyncSourcePluginScim2GroupMembers
   {
     buffer.append("LDAPSyncSourcePluginScim2GroupMembers(userIdAttribute='");
     buffer.append(userIdAttribute);
+    buffer.append("', groupFilter='");
+    buffer.append(groupFilter != null ? groupFilter.toString() : "null");
     buffer.append("')");
   }
 }
