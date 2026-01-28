@@ -469,11 +469,19 @@ public class LDAPSyncSourcePluginScim2GroupMembers
 
       // Check if this is a dynamic group (has memberURL attribute)
       String[] memberUrls = entry.getAttributeValues("memberURL");
-      if (memberUrls == null || memberUrls.length == 0)
+      boolean isDynamicGroup = (memberUrls != null && memberUrls.length > 0);
+      
+      // Check if this is a static group (has member or uniqueMember attributes)
+      String[] memberDNs = entry.getAttributeValues("member");
+      String[] uniqueMemberDNs = entry.getAttributeValues("uniqueMember");
+      boolean isStaticGroup = (memberDNs != null && memberDNs.length > 0) || 
+                               (uniqueMemberDNs != null && uniqueMemberDNs.length > 0);
+      
+      if (!isDynamicGroup && !isStaticGroup)
       {
-        // Not a dynamic group - continue without modification
+        // Not a group that we process - continue without modification
         serverContext.debugInfo("Entry " + entry.getDN() + " does not have " +
-            "memberURL attribute - not a dynamic group");
+            "memberURL, member, or uniqueMember attributes - skipping");
         return PostStepResult.CONTINUE;
       }
 
@@ -496,92 +504,131 @@ public class LDAPSyncSourcePluginScim2GroupMembers
         }
       }
 
-      operation.logInfo("Processing dynamic group: " + entry.getDN() + 
-                       " with " + memberUrls.length + " memberURL(s)");
-
       // Collect all member user IDs
       List<String> memberUserIds = new ArrayList<String>();
       
-      for (String memberUrl : memberUrls)
+      // Process dynamic group membership
+      if (isDynamicGroup)
       {
-        if (memberUrl == null || memberUrl.trim().isEmpty())
-        {
-          continue;
-        }
+        operation.logInfo("Processing dynamic group: " + entry.getDN() + 
+                         " with " + memberUrls.length + " memberURL(s)");
         
-        operation.logInfo("Parsing memberURL: " + memberUrl);
-        
-        // Parse the LDAP URL using UnboundID LDAP SDK
-        LDAPURL ldapURL = null;
-        try
+        for (String memberUrl : memberUrls)
         {
-          ldapURL = new LDAPURL(memberUrl);
-        }
-        catch (LDAPException e)
-        {
-          operation.logInfo("Could not parse memberURL: " + memberUrl + " - " + e.getMessage());
-          continue;
-        }
-        
-        // Extract search parameters from the LDAP URL
-        DN baseDN = ldapURL.getBaseDN();
-        SearchScope scope = ldapURL.getScope();
-        Filter filter = ldapURL.getFilter();
-        
-        // Use default values if not specified in URL
-        if (baseDN == null)
-        {
-          operation.logInfo("memberURL does not contain a base DN, skipping: " + memberUrl);
-          continue;
-        }
-        
-        if (scope == null)
-        {
-          scope = SearchScope.SUB; // Default to subtree scope
-        }
-        
-        if (filter == null)
-        {
-          filter = Filter.createPresenceFilter("objectClass"); // Default to (objectClass=*)
-        }
-        
-        // Perform search to find matching users
-        try
-        {
-          SearchRequest searchRequest = new SearchRequest(
-              baseDN.toString(),
-              scope,
-              filter,
-              userIdAttribute);
-          
-          operation.logInfo("Searching for group members with base DN: " + 
-                           baseDN + ", scope: " + scope + 
-                           ", filter: " + filter);
-          
-          List<SearchResultEntry> searchResults = 
-              sourceConnection.search(searchRequest).getSearchEntries();
-          
-          operation.logInfo("Found " + searchResults.size() + " matching users");
-          
-          // Extract user ID from each result
-          for (SearchResultEntry userEntry : searchResults)
+          if (memberUrl == null || memberUrl.trim().isEmpty())
           {
-            String userId = userEntry.getAttributeValue(userIdAttribute);
-            if (userId != null && !userId.trim().isEmpty())
+            continue;
+          }
+          
+          operation.logInfo("Parsing memberURL: " + memberUrl);
+          
+          // Parse the LDAP URL using UnboundID LDAP SDK
+          LDAPURL ldapURL = null;
+          try
+          {
+            ldapURL = new LDAPURL(memberUrl);
+          }
+          catch (LDAPException e)
+          {
+            operation.logInfo("Could not parse memberURL: " + memberUrl + " - " + e.getMessage());
+            continue;
+          }
+          
+          // Extract search parameters from the LDAP URL
+          DN baseDN = ldapURL.getBaseDN();
+          SearchScope scope = ldapURL.getScope();
+          Filter filter = ldapURL.getFilter();
+          
+          // Use default values if not specified in URL
+          if (baseDN == null)
+          {
+            operation.logInfo("memberURL does not contain a base DN, skipping: " + memberUrl);
+            continue;
+          }
+          
+          if (scope == null)
+          {
+            scope = SearchScope.SUB; // Default to subtree scope
+          }
+          
+          if (filter == null)
+          {
+            filter = Filter.createPresenceFilter("objectClass"); // Default to (objectClass=*)
+          }
+          
+          // Perform search to find matching users
+          try
+          {
+            SearchRequest searchRequest = new SearchRequest(
+                baseDN.toString(),
+                scope,
+                filter,
+                userIdAttribute);
+            
+            operation.logInfo("Searching for group members with base DN: " + 
+                             baseDN + ", scope: " + scope + 
+                             ", filter: " + filter);
+            
+            List<SearchResultEntry> searchResults = 
+                sourceConnection.search(searchRequest).getSearchEntries();
+            
+            operation.logInfo("Found " + searchResults.size() + " matching users");
+            
+            // Extract user ID from each result
+            for (SearchResultEntry userEntry : searchResults)
+            {
+              String userId = userEntry.getAttributeValue(userIdAttribute);
+              if (userId != null && !userId.trim().isEmpty())
+              {
+                memberUserIds.add(userId);
+              }
+              else
+              {
+                operation.logInfo("Warning: User entry " + userEntry.getDN() + 
+                                 " does not have " + userIdAttribute + " attribute");
+              }
+            }
+          }
+          catch (LDAPException e)
+          {
+            operation.logError("Error searching for group members: " + e.getMessage());
+            // Continue processing other memberURLs
+          }
+        }
+      }
+      
+      // Process static group membership
+      if (isStaticGroup)
+      {
+        operation.logInfo("Processing static group: " + entry.getDN() + 
+                         " with " + 
+                         (memberDNs != null ? memberDNs.length : 0) + " member(s) and " +
+                         (uniqueMemberDNs != null ? uniqueMemberDNs.length : 0) + " uniqueMember(s)");
+        
+        // Process member attribute DNs
+        if (memberDNs != null)
+        {
+          for (String memberDN : memberDNs)
+          {
+            String userId = lookupUserIdFromDN(sourceConnection, memberDN, operation);
+            if (userId != null)
             {
               memberUserIds.add(userId);
             }
-            else
-            {
-              operation.logInfo("Warning: User entry " + userEntry.getDN() + 
-                               " does not have " + userIdAttribute + " attribute");
-            }
           }
         }
-        catch (LDAPException e)
+        
+        // Process uniqueMember attribute DNs
+        if (uniqueMemberDNs != null)
         {
-          operation.logError("Error searching for group members: " + e.getMessage());
-          // Continue processing other memberURLs
+          for (String uniqueMemberDN : uniqueMemberDNs)
+          {
+            String userId = lookupUserIdFromDN(sourceConnection, uniqueMemberDN, operation);
+            if (userId != null)
+            {
+              memberUserIds.add(userId);
+            }
+          }
         }
       }
       
