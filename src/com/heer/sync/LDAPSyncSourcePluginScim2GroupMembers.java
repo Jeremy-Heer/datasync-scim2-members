@@ -93,11 +93,12 @@ import com.unboundid.util.args.StringArgument;
  *   <LI>user-id-attribute -- The LDAP attribute on user entries that contains the
  *                            unique user ID (e.g., uid, sAMAccountName). This value
  *                            will be extracted and added to the members attribute.</LI>
- *   <LI>group-filter -- (Optional) An LDAP filter to determine which dynamic groups
- *                       should have their membership expanded. If not specified, all
- *                       groups with memberURL attributes will be processed. This can
- *                       significantly improve performance by limiting expensive member
- *                       lookups to relevant groups only.</LI>
+ *   <LI>group-filter -- (Optional) An LDAP filter to determine which groups (both
+ *                       dynamic and static) should have their membership expanded.
+ *                       If not specified, all groups with memberURL, member, or
+ *                       uniqueMember attributes will be processed. This can significantly
+ *                       improve performance by limiting expensive member lookups to
+ *                       relevant groups only.</LI>
  * </UL>
  * 
  * <p>The base DN for user searches is extracted from the memberURL attribute in the
@@ -209,11 +210,12 @@ public class LDAPSyncSourcePluginScim2GroupMembers
          false,  // required
          1,  // maxOccurrences
          "{filter}",  // placeholder
-         "An optional LDAP filter to determine which dynamic groups should have " +
-         "their membership expanded. If not specified, all groups with memberURL " +
-         "attributes will be processed. Examples: '(cn=scim-*)' to process only " +
-         "groups starting with 'scim-', or '(description=*sync*)' to process " +
-         "groups with 'sync' in their description. This can significantly improve " +
+         "An optional LDAP filter to determine which groups (both dynamic and static) " +
+         "should have their membership expanded. If not specified, all groups with " +
+         "memberURL, member, or uniqueMember attributes will be processed. " +
+         "Examples: '(cn=scim-*)' to process only groups starting with 'scim-', or " +
+         "'(description=*sync*)' to process groups with 'sync' in their description, or " +
+         "'(cn=admins)' to process only the admins group. This can significantly improve " +
          "performance by limiting expensive member lookups to relevant groups only.");
     parser.addArgument(groupFilterArg);
   }
@@ -490,12 +492,25 @@ public class LDAPSyncSourcePluginScim2GroupMembers
       {
         try
         {
+          // Build attribute list for debugging
+          StringBuilder attrList = new StringBuilder();
+          for (Attribute attr : entry.getAttributes())
+          {
+            if (attrList.length() > 0) attrList.append(", ");
+            attrList.append(attr.getName());
+          }
+          
+          operation.logInfo("Evaluating group filter '" + groupFilter + "' against entry: " + 
+                           entry.getDN() + " (attributes: " + attrList + ")");
+          
           if (!groupFilter.matchesEntry(entry))
           {
-            serverContext.debugInfo("Entry " + entry.getDN() + 
-                " does not match group filter - skipping member expansion");
+            operation.logInfo("Entry " + entry.getDN() + 
+                " does not match group filter '" + groupFilter + "' - skipping member expansion");
             return PostStepResult.CONTINUE;
           }
+          
+          operation.logInfo("Entry " + entry.getDN() + " matches group filter - proceeding with member expansion");
         }
         catch (LDAPException e)
         {
