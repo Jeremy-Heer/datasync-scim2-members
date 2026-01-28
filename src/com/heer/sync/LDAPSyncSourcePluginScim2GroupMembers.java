@@ -63,15 +63,24 @@ import com.unboundid.util.args.StringArgument;
 
 
 /**
- * This LDAP sync source plugin handles group resync operations for dynamic LDAP groups,
- * constructing a members attribute containing user IDs for each group member.
+ * This LDAP sync source plugin handles group resync operations for both dynamic and static
+ * LDAP groups, constructing a members attribute containing user IDs for each group member.
  * 
- * <p>For group resync operations, this plugin:
+ * <p>For dynamic group resync operations, this plugin:
  * <UL>
  *   <LI>Detects dynamic groups (entries with memberURL attribute)</LI>
  *   <LI>Parses the memberURL to determine membership criteria (LDAP URL format)</LI>
  *   <LI>Queries the LDAP server to find all users matching the membership criteria</LI>
  *   <LI>Extracts the uid value from each member user</LI>
+ *   <LI>Constructs a multi-valued members attribute containing all member uids</LI>
+ *   <LI>Sends the group with the constructed members attribute to the destination</LI>
+ * </UL>
+ * 
+ * <p>For static group resync operations (groupOfNames, groupOfUniqueNames), this plugin:
+ * <UL>
+ *   <LI>Detects static groups (entries with member or uniqueMember attributes)</LI>
+ *   <LI>Extracts DN values from member/uniqueMember attributes</LI>
+ *   <LI>Looks up each user DN to retrieve the configured user ID attribute (e.g., uid)</LI>
  *   <LI>Constructs a multi-valued members attribute containing all member uids</LI>
  *   <LI>Sends the group with the constructed members attribute to the destination</LI>
  * </UL>
@@ -141,14 +150,17 @@ public class LDAPSyncSourcePluginScim2GroupMembers
   {
     return new String[]
     {
-      "This LDAP sync source plugin handles group resync operations for dynamic LDAP groups. " +
-      "It constructs a members attribute containing user IDs for each group member by " +
-      "parsing the memberURL attribute, querying matching users, and extracting their uid values.",
+      "This LDAP sync source plugin handles group resync operations for both dynamic and static " +
+      "LDAP groups. It constructs a members attribute containing user IDs for each group member.",
       
-      "The plugin detects dynamic groups (entries with memberURL attribute), parses the " +
-      "LDAP URL to determine membership criteria, and queries the LDAP server to find all " +
-      "users matching the criteria. It then extracts the configured user ID attribute value " +
-      "from each member and constructs a multi-valued members attribute.",
+      "For dynamic groups, it parses the memberURL attribute, queries matching users, and " +
+      "extracts their uid values. For static groups (groupOfNames, groupOfUniqueNames), it " +
+      "processes member/uniqueMember attributes, looks up each DN to retrieve the uid value, " +
+      "and constructs the members attribute.",
+      
+      "The plugin detects groups with memberURL (dynamic), member, or uniqueMember (static) " +
+      "attributes, processes the membership data, and extracts the configured user ID attribute " +
+      "value from each member to construct a multi-valued members attribute.",
       
       "This members attribute is then sent to the Scim2GroupMemberDestination plugin, which " +
       "updates the SCIM2 group membership accordingly during resync operations."
@@ -364,19 +376,20 @@ public class LDAPSyncSourcePluginScim2GroupMembers
     exampleMap.put(
          Arrays.asList(
               ARG_NAME_USER_ID_ATTRIBUTE + "=uid"),
-         "Expands dynamic group membership for groups with memberURL attributes, " +
-         "extracting uid values from matching user entries and constructing a " +
-         "members attribute for synchronization to SCIM2 destination. " +
-         "The base DN for user searches is extracted from the memberURL in each group.");
+         "Expands group membership for both dynamic groups (with memberURL attributes) " +
+         "and static groups (with member/uniqueMember attributes), extracting uid values " +
+         "from member entries and constructing a members attribute for synchronization " +
+         "to SCIM2 destination. For dynamic groups, the base DN is extracted from the " +
+         "memberURL. For static groups, each member DN is looked up to retrieve the uid.");
 
     exampleMap.put(
          Arrays.asList(
               ARG_NAME_USER_ID_ATTRIBUTE + "=uid",
               ARG_NAME_GROUP_FILTER + "=(cn=scim-*)"),
-         "Same as the first example, but only processes dynamic groups whose cn " +
-         "attribute starts with 'scim-'. This significantly improves performance by " +
-         "limiting expensive member lookups to only the groups that need to be " +
-         "synchronized to SCIM2.");
+         "Same as the first example, but only processes groups whose cn attribute starts " +
+         "with 'scim-'. This significantly improves performance by limiting expensive " +
+         "member lookups to only the groups that need to be synchronized to SCIM2. " +
+         "Supports both dynamic and static group types.");
 
     return exampleMap;
   }
@@ -595,6 +608,68 @@ public class LDAPSyncSourcePluginScim2GroupMembers
   }
 
 
+
+
+  /**
+   * Looks up a user by DN and retrieves their user ID attribute value.
+   * This is used for static group membership where member/uniqueMember contain DNs.
+   * 
+   * @param sourceConnection The LDAP connection to use for the lookup
+   * @param memberDN The DN of the user to look up
+   * @param operation The sync operation for logging
+   * @return The user ID value, or null if not found
+   */
+  private String lookupUserIdFromDN(final LDAPInterface sourceConnection,
+                                     final String memberDN,
+                                     final SyncOperation operation)
+  {
+    try
+    {
+      // Parse the DN to ensure it's valid
+      DN dn = new DN(memberDN);
+      
+      // First, try to extract the user ID from the DN itself (optimization)
+      // This handles cases like "uid=jdoe,ou=people,dc=example,dc=com"
+      String rdnValue = dn.getRDN().getAttributeValues()[0];
+      String rdnAttrName = dn.getRDN().getAttributeNames()[0];
+      
+      if (rdnAttrName.equalsIgnoreCase(userIdAttribute))
+      {
+        operation.logInfo("Extracted user ID '" + rdnValue + 
+                         "' directly from DN: " + memberDN);
+        return rdnValue;
+      }
+      
+      // If not in the RDN, perform an LDAP lookup to get the attribute
+      operation.logInfo("Looking up user ID attribute '" + userIdAttribute + 
+                       "' for DN: " + memberDN);
+      
+      SearchResultEntry userEntry = sourceConnection.getEntry(memberDN, userIdAttribute);
+      
+      if (userEntry == null)
+      {
+        operation.logInfo("Could not find user entry for DN: " + memberDN);
+        return null;
+      }
+      
+      String userId = userEntry.getAttributeValue(userIdAttribute);
+      if (userId == null)
+      {
+        operation.logInfo("User entry " + memberDN + 
+                           " does not have attribute: " + userIdAttribute);
+        return null;
+      }
+      
+      operation.logInfo("Found user ID '" + userId + "' for DN: " + memberDN);
+      return userId;
+    }
+    catch (LDAPException e)
+    {
+      operation.logError("Error looking up user ID for DN " + memberDN + ": " + 
+                        e.getMessage());
+      return null;
+    }
+  }
 
 
   /**

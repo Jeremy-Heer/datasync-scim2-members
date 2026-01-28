@@ -1,0 +1,55 @@
+{
+    "schemas": [
+        "urn:ietf:params:scim:schemas:core:2.0:Group"
+    ],
+    "id": "ebcd0e69-5d77-4da4-a1f6-30b2be63375d",
+    "meta": {
+        "resourceType": "Group",
+        "lastModified": 1759923866384,
+        "location": "http://localhost:9080/scim/v2/Groups/ebcd0e69-5d77-4da4-a1f6-30b2be63375d",
+        "version": "1759923866383"
+    },
+    "displayName": "admins",
+    "members": [
+        {
+            "value": "4ed24fe9-1891-4fc9-bab2-73f2f25b09b3",
+            "$ref": "http://localhost:9080/scim/v2/Users/4ed24fe9-1891-4fc9-bab2-73f2f25b09b3"
+        },
+        {
+            "value": "835f8b1f-8a88-4c5f-9d68-a8fd3e89678b",
+            "$ref": "http://localhost:9080/scim/v2/Users/835f8b1f-8a88-4c5f-9d68-a8fd3e89678b"
+        },
+        {
+            "value": "e0420a35-a92d-401c-8a34-6a71506814fc",
+            "$ref": "http://localhost:9080/scim/v2/Users/e0420a35-a92d-401c-8a34-6a71506814fc"
+        },
+        {
+            "value": "160fd6af-5f59-462b-abeb-586050bf7e5f",
+            "$ref": "http://localhost:9080/scim/v2/Users/160fd6af-5f59-462b-abeb-586050bf7e5f"
+        },
+        {
+            "value": "636fd808-0336-4d75-9990-4805a0d3ce09",
+            "$ref": "http://localhost:9080/scim/v2/Users/636fd808-0336-4d75-9990-4805a0d3ce09"
+        },
+        {
+            "value": "69b70910-a5e9-4d9e-8c85-8f9d83c5dd2e",
+            "$ref": "http://localhost:9080/scim/v2/Users/69b70910-a5e9-4d9e-8c85-8f9d83c5dd2e"
+        },
+        {
+            "value": "1a19b000-4d97-4cce-a844-2d81df331c2c",
+            "$ref": "http://localhost:9080/scim/v2/Users/1a19b000-4d97-4cce-a844-2d81df331c2c"
+        },
+        {
+            "value": "daa5ca90-11bd-4aaf-8583-08791e79a94e",
+            "$ref": "http://localhost:9080/scim/v2/Users/daa5ca90-11bd-4aaf-8583-08791e79a94e"
+        },
+        {
+            "value": "0029606b-34ab-4ae1-bb7f-6c27ff456799",
+            "$ref": "http://localhost:9080/scim/v2/Users/0029606b-34ab-4ae1-bb7f-6c27ff456799"
+        },
+        {
+            "value": "3c141b5a-6a8b-4e08-be2f-188a215a21ff",
+            "$ref": "http://localhost:9080/scim/v2/Users/3c141b5a-6a8b-4e08-be2f-188a215a21ff"
+        }
+    ]
+}

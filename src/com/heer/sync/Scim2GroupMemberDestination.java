@@ -103,6 +103,7 @@ import javax.net.ssl.X509TrustManager;
  *    - Ignores user resync operations (createEntry for users)
  *    - Processes group resync operations via modifyEntry
  *    - Reads members attribute containing user IDs from source plugin
+ *      (works for both dynamic groups with memberURL and static groups with member/uniqueMember)
  *    - Searches SCIM2 for each user ID to get SCIM2 user IDs
  *    - Replaces entire SCIM2 group membership with PUT operation
  * 
@@ -124,6 +125,8 @@ import javax.net.ssl.X509TrustManager;
  * 1. fetchEntry: Maps LDAP group to SCIM2 group by group name
  * 2. modifyEntry: Detects group entry (has scim2GroupId attribute)
  * 3. processGroupResync: Reads members attribute (user IDs from source plugin)
+ *    - For dynamic groups: source plugin expands memberURL to get user IDs
+ *    - For static groups: source plugin looks up member/uniqueMember DNs to get user IDs
  * 4. Searches SCIM2 for each user ID to get SCIM2 user IDs
  * 5. Performs PUT operation to replace entire group membership
  * 
