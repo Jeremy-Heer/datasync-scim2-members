@@ -1,0 +1,205 @@
+# SCIM2 Sync Plugin Configuration
+# ================================
+# Shared configuration file for SCIM2 sync plugins (static/dynamic group sources and destinations)
+#
+# This file uses Java Properties format with key=value pairs.
+# Lines starting with # are comments.
+#
+# IMPORTANT: This file may contain sensitive credentials. Protect it with appropriate
+# file system permissions:
+#   chmod 600 /path/to/scim-sync.properties
+#   chown <sync-server-user>:<sync-server-group> /path/to/scim-sync.properties
+
+# ==============================================================================
+# LDAP SOURCE CONFIGURATION
+# ==============================================================================
+
+# The LDAP attribute on user entries that contains the unique user ID
+# This is used when expanding group membership (both static and dynamic groups)
+# Examples: uid, sAMAccountName, employeeNumber
+# REQUIRED
+user.id.attribute=uid
+
+# Optional LDAP filter to determine which groups should have their membership expanded
+# If not specified, ALL groups (static and dynamic) will be processed
+# Use this to limit processing to relevant groups for performance optimization
+# Used by: StaticGroupSourcePlugin, DynamicGroupSourcePlugin, GroupBasicCrudSourcePlugin
+# Examples:
+#   (cn=scim-*)              - Process only groups starting with "scim-"
+#   (description=*sync*)     - Process groups with "sync" in description
+#   (objectClass=groupOfNames)  - Process only static groups
+# OPTIONAL
+# group.filter=(cn=scim-*)
+
+# LDAP attributes that indicate group membership on user entries
+# Used by source plugins to filter users based on group membership scope
+# These MUST be real attributes that produce changelog events.
+# Virtual attributes like 'memberOf' will NOT work for changelog-based pipes.
+# Multiple attributes can be specified separated by commas.
+# Used by: UserBasicCrudSourcePlugin, UserGroupMembershipSourcePlugin
+# Examples: scim-groups, groupMembership
+# REQUIRED (for user source plugins)
+group.membership.attributes=scim-groups
+
+# ==============================================================================
+# SCIM2 DESTINATION CONFIGURATION  
+# ==============================================================================
+
+# SCIM2 API base URL (without trailing slash)
+# Example: https://api.example.com/scim/v2
+# REQUIRED (for destination plugins)
+# scim2.base.url=https://api.example.com/scim/v2
+
+# SCIM2 Users base path
+# Default: /Users
+# OPTIONAL
+# scim2.user.base=/Users
+
+# SCIM2 Groups base path
+# Default: /Groups
+# OPTIONAL
+# scim2.group.base=/Groups
+
+# SCIM2 Authentication Type: basic or bearer
+# Default: basic
+# REQUIRED (for destination plugins)
+# scim2.auth.type=basic
+
+# Basic Authentication credentials (if auth.type=basic)
+# REQUIRED (if using basic auth)
+# scim2.username=sync-service-account
+# scim2.password=changeme
+
+# Bearer Token Authentication (if auth.type=bearer)
+# REQUIRED (if using bearer auth)
+# scim2.bearer.token=your-bearer-token-here
+
+# ==============================================================================
+# STATIC GROUP DESTINATION CONFIGURATION
+# ==============================================================================
+
+# The LDAP attribute used to look up users in SCIM2
+# This should match the user ID values in the 'members' attribute from StaticGroupSourcePlugin
+# Default: uid
+# OPTIONAL
+# user.lookup.attribute=uid
+
+# Number of member add/remove operations to batch into a single PATCH request
+# If the number of operations exceeds this threshold, multiple PATCH requests will be sent
+# This optimization improves performance for large membership changes
+# This does NOT apply to REPLACE operations (resync), which always use a single PUT request
+# Default: 50
+# OPTIONAL
+# static.group.batch.threshold=50
+
+# ==============================================================================
+# USER GROUP MEMBERSHIP DESTINATION CONFIGURATION
+# ==============================================================================
+
+# Note: group.membership.attributes is defined in LDAP SOURCE CONFIGURATION section above
+# and is shared across both source and destination plugins
+
+# The LDAP attribute used to look up users in SCIM2
+# This should match the userName field in SCIM2.
+# Default: uid
+# OPTIONAL
+# user.lookup.attribute=uid
+
+# ==============================================================================
+# PERFORMANCE AND RELIABILITY CONFIGURATION
+# ==============================================================================
+
+# Maximum number of retry attempts for failed SCIM2 API calls
+# Uses exponential backoff between retries
+# Default: 3
+# OPTIONAL
+# scim2.max.retries=3
+
+# Initial retry delay in milliseconds (exponential backoff)
+# Subsequent retries will wait longer (e.g., 1000ms, 2000ms, 4000ms)
+# Default: 1000 (1 second)
+# OPTIONAL
+# scim2.retry.delay.ms=1000
+
+# Connection timeout in milliseconds
+# If a connection cannot be established within this time, the request will fail
+# Default: 30000 (30 seconds)
+# OPTIONAL
+# scim2.connect.timeout.ms=30000
+
+# Read timeout in milliseconds
+# If a response is not received within this time after connection, the request will fail
+# Default: 60000 (60 seconds)
+# OPTIONAL
+# scim2.read.timeout.ms=60000
+
+# ==============================================================================
+# HTTP PROXY CONFIGURATION
+# ==============================================================================
+
+# HTTP proxy server hostname or IP address
+# When specified, all SCIM2 requests will be routed through this proxy
+# OPTIONAL
+# scim2.proxy.host=proxy.company.com
+
+# HTTP proxy server port number
+# Required when proxy.host is specified
+# OPTIONAL
+# scim2.proxy.port=8080
+
+# Proxy authentication username
+# Required if proxy requires authentication
+# OPTIONAL
+# scim2.proxy.username=proxyuser
+
+# Proxy authentication password
+# Required if proxy requires authentication
+# OPTIONAL
+# scim2.proxy.password=proxypass
+
+# Proxy type: HTTP or SOCKS
+# Default: HTTP
+# OPTIONAL
+# scim2.proxy.type=HTTP
+
+# ==============================================================================
+# TLS/SSL CONFIGURATION
+# ==============================================================================
+
+# Path to custom truststore for SCIM2 endpoint SSL/TLS certificates
+# Use this for internal CA or self-signed certificates in enterprise environments
+# If not specified, uses JVM default truststore
+# OPTIONAL
+# scim2.trust.store.path=/opt/sync/config/truststore.jks
+
+# Truststore password
+# Required when trust.store.path is specified
+# OPTIONAL
+# scim2.trust.store.password=changeme
+
+# Truststore type (JKS, PKCS12, JCEKS, etc.)
+# Default: JKS
+# OPTIONAL
+# scim2.trust.store.type=JKS
+
+# Allow connections to HTTPS endpoints with untrusted certificates
+# (self-signed, expired, wrong hostname, etc.)
+# WARNING: This disables certificate validation and should ONLY be used
+# in development/testing environments. NEVER use in production.
+# Default: false
+# OPTIONAL
+# scim2.allow.untrusted.certificates=false
+
+# ==============================================================================
+# LOGGING AND DEBUGGING
+# ==============================================================================
+
+# Enable verbose debug logging
+# Default: false
+# OPTIONAL
+# debug.enabled=false
+
+# Log SCIM2 API requests and responses (may log sensitive data)
+# Default: false
+# OPTIONAL
+# debug.log.api.calls=false
