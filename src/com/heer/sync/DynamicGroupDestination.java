@@ -542,24 +542,7 @@ public class DynamicGroupDestination extends SyncDestination
    */
   private String getConfigValue(StringArgument arg, String configKey, String defaultValue)
   {
-    // Check inline argument first
-    if (arg != null && arg.isPresent())
-    {
-      return arg.getValue();
-    }
-    
-    // Check config file
-    if (configFileLoader != null && configKey != null)
-    {
-      String value = configFileLoader.getProperty(configKey);
-      if (value != null)
-      {
-        return value;
-      }
-    }
-    
-    // Return default
-    return defaultValue;
+    return configFileLoader.getValueWithFallback(arg, configKey, defaultValue);
   }
 
   /**
@@ -567,19 +550,17 @@ public class DynamicGroupDestination extends SyncDestination
    */
   private int getConfigValueAsInt(StringArgument arg, String configKey, int defaultValue)
   {
-    String strValue = getConfigValue(arg, configKey, null);
-    if (strValue != null)
+    // Check argument first
+    if (arg != null && arg.isPresent())
     {
-      try
-      {
-        return Integer.parseInt(strValue);
-      }
-      catch (NumberFormatException e)
-      {
-        serverContext.debugInfo("Invalid integer value for " + configKey + ": " + strValue +
-                               ", using default: " + defaultValue);
+      try {
+        return Integer.parseInt(arg.getValue());
+      } catch (NumberFormatException e) {
+        serverContext.debugInfo("Invalid integer value for argument: " + arg.getValue());
       }
     }
-    return defaultValue;
+    
+    // Use ConfigFileLoader's getIntProperty
+    return configFileLoader != null ? configFileLoader.getIntProperty(configKey, defaultValue) : defaultValue;
   }
 }

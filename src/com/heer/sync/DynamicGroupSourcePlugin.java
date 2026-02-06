@@ -29,6 +29,7 @@ package com.heer.sync;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -39,6 +40,7 @@ import com.heer.sync.lib.ConfigFileLoader;
 import com.heer.sync.lib.ConfigLockManager;
 import com.heer.sync.lib.GroupTypeDetector;
 import com.heer.sync.lib.LoggingHelper;
+import com.heer.sync.lib.UserIdLookupUtil;
 import com.unboundid.directory.sdk.sync.api.LDAPSyncSourcePlugin;
 import com.unboundid.directory.sdk.sync.config.LDAPSyncSourcePluginConfig;
 import com.unboundid.directory.sdk.sync.types.PostStepResult;
@@ -96,6 +98,9 @@ public class DynamicGroupSourcePlugin extends LDAPSyncSourcePlugin
   
   private static final String PROP_USER_ID_ATTRIBUTE = "user.id.attribute";
   private static final String PROP_GROUP_FILTER = "group.filter";
+  private static final String PROP_USER_LIFECYCLE_MODE = "user.lifecycle.mode";
+  private static final String PROP_SCIM_USER_ATTRIBUTES = "scim.user.attributes";
+  private static final String PROP_SCIM_USER_MAP_PREFIX = "scim.user.map.";
   
   // The server context for the server in which this extension is running
   private SyncServerContext serverContext;
@@ -111,6 +116,15 @@ public class DynamicGroupSourcePlugin extends LDAPSyncSourcePlugin
   
   // Optional LDAP filter to determine which groups should have membership expanded
   private Filter groupFilter;
+  
+  // User lifecycle mode (dynamic-group-memberships)
+  private String userLifecycleMode;
+  
+  // SCIM user attributes to map from LDAP
+  private String[] scimUserAttributes;
+  
+  // SCIM user attribute mappings (SCIM attr -> LDAP attr)
+  private Map<String, String> scimUserMappings;
 
   @Override
   public String getExtensionName()
@@ -360,6 +374,36 @@ public class DynamicGroupSourcePlugin extends LDAPSyncSourcePlugin
       {
         this.groupFilter = null;
       }
+      
+      // Get user lifecycle mode from config file
+      if (configFileLoader != null)
+      {
+        this.userLifecycleMode = configFileLoader.getProperty(PROP_USER_LIFECYCLE_MODE);
+      }
+      else
+      {
+        this.userLifecycleMode = null;
+      }
+      
+      // Get SCIM user attributes list from config file
+      if (configFileLoader != null)
+      {
+        this.scimUserAttributes = configFileLoader.getPropertyList(PROP_SCIM_USER_ATTRIBUTES);
+      }
+      else
+      {
+        this.scimUserAttributes = null;
+      }
+      
+      // Get SCIM user attribute mappings from config file
+      if (configFileLoader != null)
+      {
+        this.scimUserMappings = configFileLoader.getPropertyMap(PROP_SCIM_USER_MAP_PREFIX);
+      }
+      else
+      {
+        this.scimUserMappings = new LinkedHashMap<String, String>();
+      }
     }
     finally
     {
@@ -487,8 +531,8 @@ public class DynamicGroupSourcePlugin extends LDAPSyncSourcePlugin
           "Processing dynamic group: " + entry.getDN() + " with " + 
           memberUrls.length + " memberURL(s)");
 
-      // Collect all member user IDs
-      List<String> memberUserIds = new ArrayList<String>();
+      // Collect all member mappings with enhanced format
+      List<String> memberMappings = new ArrayList<String>();
 
       // Process each memberURL
       for (String memberUrl : memberUrls)
@@ -555,13 +599,16 @@ public class DynamicGroupSourcePlugin extends LDAPSyncSourcePlugin
           LoggingHelper.logInfo(operation, 
               "Found " + searchResults.size() + " matching users");
 
-          // Extract user ID from each result
+          // Extract user ID and build mapping for each result
           for (SearchResultEntry userEntry : searchResults)
           {
             String userId = userEntry.getAttributeValue(userIdAttribute);
             if (userId != null && !userId.trim().isEmpty())
             {
-              memberUserIds.add(userId);
+              // Build enhanced mapping with user attributes
+              String mapping = buildMemberMapping(
+                  sourceConnection, userId, "REPLACE", userEntry.getDN(), operation);
+              memberMappings.add(mapping);
             }
             else
             {
@@ -579,20 +626,23 @@ public class DynamicGroupSourcePlugin extends LDAPSyncSourcePlugin
         }
       }
 
-      // Add the members attribute to the group entry
-      if (memberUserIds.isEmpty())
+      // Add the memberMappings attribute to the group entry
+      if (memberMappings.isEmpty())
       {
         LoggingHelper.logInfo(operation, 
-            "No member user IDs found for group: " + entry.getDN());
-        entry.setAttribute(new Attribute("members", new String[0]));
+            "No member mappings found for group: " + entry.getDN());
+        entry.setAttribute(new Attribute("memberMappings", new String[0]));
       }
       else
       {
         LoggingHelper.logInfo(operation, 
-            "Adding " + memberUserIds.size() + " member user IDs to group: " + 
+            "Adding " + memberMappings.size() + " member mappings to group: " + 
             entry.getDN());
-        entry.setAttribute(new Attribute("members", memberUserIds));
+        entry.setAttribute(new Attribute("memberMappings", memberMappings));
       }
+      
+      // Mark the attribute as modified for the destination
+      operation.addModifiedDestinationAttribute("memberMappings");
 
       return PostStepResult.CONTINUE;
     }
@@ -600,6 +650,112 @@ public class DynamicGroupSourcePlugin extends LDAPSyncSourcePlugin
     {
       lockManager.readLock().unlock();
     }
+  }
+
+  /**
+   * Builds an enhanced member mapping string that includes user attributes for user creation.
+   * Format: userId::operationType::DN::{"scimAttr":"value",...}
+   * 
+   * @param sourceConnection The connection to the source LDAP directory
+   * @param userId The user ID extracted from the user entry
+   * @param operationType The operation type (REPLACE for dynamic groups)
+   * @param dn The DN of the user entry
+   * @param operation The sync operation for logging
+   * @return Enhanced mapping string with user attributes, or basic format if no attributes configured
+   */
+  private String buildMemberMapping(final LDAPInterface sourceConnection,
+                                     final String userId,
+                                     final String operationType,
+                                     final String dn,
+                                     final SyncOperation operation)
+  {
+    // Basic format without user attributes
+    String basicMapping = userId + "::" + operationType + "::" + dn;
+    
+    // If no SCIM user attributes configured, return basic format
+    if (scimUserAttributes == null || scimUserAttributes.length == 0)
+    {
+      return basicMapping;
+    }
+    
+    try
+    {
+      Map<String, String> userData = new HashMap<String, String>();
+      
+      // For REPLACE in dynamic-group-memberships mode, fetch user attributes for creation
+      if ("dynamic-group-memberships".equalsIgnoreCase(userLifecycleMode) &&
+          "REPLACE".equals(operationType))
+      {
+        // Build list of LDAP attributes to fetch
+        List<String> ldapAttrsToFetch = new ArrayList<String>();
+        for (String scimAttr : scimUserAttributes)
+        {
+          String ldapAttr = scimUserMappings.get(scimAttr);
+          if (ldapAttr != null && !ldapAttr.isEmpty())
+          {
+            ldapAttrsToFetch.add(ldapAttr);
+          }
+        }
+        
+        if (!ldapAttrsToFetch.isEmpty())
+        {
+          // Fetch user entry with required attributes
+          Entry userEntry = sourceConnection.getEntry(dn, ldapAttrsToFetch.toArray(new String[0]));
+          if (userEntry != null)
+          {
+            // Map LDAP attributes to SCIM attributes
+            for (String scimAttr : scimUserAttributes)
+            {
+              String ldapAttr = scimUserMappings.get(scimAttr);
+              if (ldapAttr != null)
+              {
+                String value = userEntry.getAttributeValue(ldapAttr);
+                if (value != null && !value.isEmpty())
+                {
+                  userData.put(scimAttr, value);
+                }
+              }
+            }
+            LoggingHelper.logDebug(serverContext,
+                "Fetched " + userData.size() + " user attributes for " + userId);
+          }
+          else
+          {
+            LoggingHelper.logInfo(operation,
+                "Could not fetch user entry for DN: " + dn);
+          }
+        }
+      }
+      
+      // Build JSON string for user data
+      if (!userData.isEmpty())
+      {
+        StringBuilder json = new StringBuilder("{");
+        boolean first = true;
+        for (Map.Entry<String, String> entry : userData.entrySet())
+        {
+          if (!first)
+          {
+            json.append(",");
+          }
+          first = false;
+          // Simple JSON encoding - escape quotes and backslashes
+          String key = entry.getKey().replace("\\\\", "\\\\\\\\").replace("\"", "\\\\\"");
+          String value = entry.getValue().replace("\\\\", "\\\\\\\\").replace("\"", "\\\\\"");
+          json.append("\"").append(key).append("\":\"").append(value).append("\"");
+        }
+        json.append("}");
+        
+        return basicMapping + "::" + json.toString();
+      }
+    }
+    catch (LDAPException e)
+    {
+      LoggingHelper.logInfo(operation,
+          "Error fetching user details for " + dn + ": " + e.getMessage());
+    }
+    
+    return basicMapping;
   }
 
   @Override

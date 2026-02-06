@@ -62,11 +62,13 @@ public class UserBasicCrudSourcePlugin extends LDAPSyncSourcePlugin
   private static final String ARG_NAME_GROUP_MEMBERSHIP_ATTRIBUTES = "group-membership-attributes";
   
   private static final String PROP_GROUP_MEMBERSHIP_ATTRIBUTES = "group.membership.attributes";
+  private static final String PROP_USER_LIFECYCLE_MODE = "user.lifecycle.mode";
   
   private SyncServerContext serverContext;
   private final ConfigLockManager lockManager = new ConfigLockManager();
   private ConfigFileLoader configFileLoader;
   private List<String> groupMembershipAttributes;
+  private String userLifecycleMode;
   
   @Override
   public String getExtensionName()
@@ -260,6 +262,16 @@ public class UserBasicCrudSourcePlugin extends LDAPSyncSourcePlugin
       {
         this.groupMembershipAttributes = new ArrayList<String>();
       }
+      
+      // Get user lifecycle mode from config file
+      if (configFileLoader != null)
+      {
+        this.userLifecycleMode = configFileLoader.getProperty(PROP_USER_LIFECYCLE_MODE);
+      }
+      else
+      {
+        this.userLifecycleMode = null;
+      }
     }
     finally
     {
@@ -302,7 +314,59 @@ public class UserBasicCrudSourcePlugin extends LDAPSyncSourcePlugin
         return PostStepResult.CONTINUE;
       }
       
-      // Check if user has group membership attributes
+      // For DELETE operations, always allow through
+      // User might be member of static groups (membership tracked in group entry, not user entry)
+      // and virtual attributes like isMemberOf don't appear in changelog
+      if (operation.getType() == com.unboundid.directory.sdk.sync.types.SyncOperationType.DELETE)
+      {
+        LoggingHelper.logInfo(operation,
+            "UserBasicCrudSourcePlugin: User " + entry.getDN() + 
+            " DELETE operation - allowed (may be in static groups)");
+        return PostStepResult.CONTINUE;
+      }
+      
+      // For RESYNC operations, always allow through
+      // RESYNC operations need to process all users to ensure destination is in sync with source
+      if (operation.getType() == com.unboundid.directory.sdk.sync.types.SyncOperationType.RESYNC)
+      {
+        // For static-group-memberships mode, fetch isMemberOf attribute and add to entry
+        if ("static-group-memberships".equalsIgnoreCase(userLifecycleMode))
+        {
+          try
+          {
+            // Fetch the user entry with isMemberOf attribute
+            Entry fullEntry = sourceConnection.getEntry(entry.getDN(), "isMemberOf");
+            if (fullEntry != null)
+            {
+              Attribute isMemberOf = fullEntry.getAttribute("isMemberOf");
+              if (isMemberOf != null && isMemberOf.hasValue())
+              {
+                // Add isMemberOf to the fetched entry
+                Entry updatedEntry = entry.duplicate();
+                updatedEntry.addAttribute(isMemberOf);
+                fetchedEntryRef.set(updatedEntry);
+                
+                LoggingHelper.logInfo(operation,
+                    "UserBasicCrudSourcePlugin: Added isMemberOf attribute with " + 
+                    isMemberOf.size() + " values to user " + entry.getDN());
+              }
+            }
+          }
+          catch (LDAPException e)
+          {
+            LoggingHelper.logWarning(serverContext,
+                "UserBasicCrudSourcePlugin: Failed to fetch isMemberOf for user " + 
+                entry.getDN() + ": " + e.getMessage());
+          }
+        }
+        
+        LoggingHelper.logInfo(operation,
+            "UserBasicCrudSourcePlugin: User " + entry.getDN() + 
+            " RESYNC operation - allowed (full sync required)");
+        return PostStepResult.CONTINUE;
+      }
+      
+      // For CREATE/MODIFY operations, check if user has group membership attributes
       boolean hasGroupMembership = false;
       for (String attrName : groupMembershipAttributes)
       {

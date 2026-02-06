@@ -24,6 +24,8 @@ import com.unboundid.util.args.StringArgument;
 import com.unboundid.scim2.client.ScimService;
 import com.unboundid.scim2.common.types.GroupResource;
 import com.unboundid.scim2.common.types.Member;
+import com.unboundid.scim2.common.types.Name;
+import com.unboundid.scim2.common.types.UserResource;
 import com.unboundid.scim2.common.utils.JsonUtils;
 
 import jakarta.ws.rs.client.Client;
@@ -33,6 +35,7 @@ import jakarta.ws.rs.core.Response;
 import com.heer.sync.lib.ConfigFileLoader;
 import com.heer.sync.lib.scim2.Scim2ClientFactory;
 import com.heer.sync.lib.scim2.Scim2MemberHelper;
+import com.heer.sync.lib.scim2.Scim2UserCreationHelper;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -40,6 +43,51 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+
+/**
+ * Helper class to hold parsed member mapping data
+ */
+class MemberMappingData
+{
+  String userId;
+  String operationType;
+  String dn;
+  String jsonData;
+  Map<String, String> userAttributes;
+  
+  public MemberMappingData(String userId, String operationType, String dn, String jsonData)
+  {
+    this.userId = userId;
+    this.operationType = operationType;
+    this.dn = dn;
+    this.jsonData = jsonData;
+    this.userAttributes = new java.util.HashMap<>();
+    
+    // Parse JSON if present
+    if (jsonData != null && !jsonData.trim().isEmpty())
+    {
+      try
+      {
+        ObjectMapper mapper = JsonUtils.createObjectMapper();
+        @SuppressWarnings("unchecked")
+        Map<String, Object> map = mapper.readValue(jsonData, Map.class);
+        for (Map.Entry<String, Object> entry : map.entrySet())
+        {
+          userAttributes.put(entry.getKey(), String.valueOf(entry.getValue()));
+        }
+      }
+      catch (Exception e)
+      {
+        // JSON parsing failed, leave empty
+      }
+    }
+  }
+  
+  public boolean hasDeleteFlag()
+  {
+    return "true".equalsIgnoreCase(userAttributes.get("deleteUser"));
+  }
+}
 
 /**
  * SCIM2 Static Group Destination plugin for synchronizing static group memberships.
@@ -75,13 +123,20 @@ public class StaticGroupMemberDestination extends SyncDestination
 
   // Helper utilities
   private Scim2MemberHelper memberHelper;
+  private Scim2UserCreationHelper userCreationHelper;
 
   // Configuration parameters
+  private String baseUrl;
+  private String userBasePath;
   private String groupBasePath;
   private String userLookupAttribute;
   private int staticGroupBatchThreshold;
   private int maxRetries;
   private int retryDelayMs;
+  
+  // SCIM attribute mappings for user creation
+  private String[] scimUserAttributes;
+  private Map<String, String> scimUserMappings;
 
   @Override
   public String getExtensionName()
@@ -219,6 +274,17 @@ public class StaticGroupMemberDestination extends SyncDestination
     // Load retry and timeout configuration
     this.maxRetries = getConfigValueAsInt(null, "scim2.max.retries", 3);
     this.retryDelayMs = getConfigValueAsInt(null, "scim2.retry.delay.ms", 1000);
+    
+    // Load SCIM user attribute mappings for user creation
+    if (configFileLoader != null) {
+      this.scimUserAttributes = configFileLoader.getPropertyList("scim.user.attributes");
+      this.scimUserMappings = configFileLoader.getPropertyMap("scim.user.map.");
+      serverContext.debugInfo("Loaded " + scimUserAttributes.length + 
+                             " SCIM user attributes and " + scimUserMappings.size() + " mappings");
+    } else {
+      this.scimUserAttributes = new String[0];
+      this.scimUserMappings = new java.util.HashMap<String, String>();
+    }
 
     // Validate required configuration
     if (groupBasePath == null || groupBasePath.trim().isEmpty())
@@ -234,8 +300,9 @@ public class StaticGroupMemberDestination extends SyncDestination
       this.scimService = clientFactory.createScimService();
       this.jaxrsClient = clientFactory.createJaxrsClient();
 
-      // Get user base path for member helper
-      String userBasePath = getConfigValue(null, "scim2.user.base", "/Users");
+      // Get base URL and user base path
+      this.baseUrl = getConfigValue(null, "scim2.base.url", "");
+      this.userBasePath = getConfigValue(null, "scim2.user.base", "/Users");
 
       // Initialize member helper
       this.memberHelper = new Scim2MemberHelper(
@@ -244,6 +311,9 @@ public class StaticGroupMemberDestination extends SyncDestination
           groupBasePath,
           maxRetries,
           retryDelayMs);
+      
+      // Initialize user creation helper
+      this.userCreationHelper = new Scim2UserCreationHelper(scimService, userBasePath);
 
       // Log successful initialization
       serverContext.debugInfo("SCIM2 Static Group Destination initialized successfully");
@@ -424,25 +494,30 @@ public class StaticGroupMemberDestination extends SyncDestination
     if (memberMappings != null && memberMappings.length > 0)
     {
       // Parse mappings and group by operation type
-      Map<String, List<String>> operationGroups = new java.util.HashMap<String, List<String>>();
-      operationGroups.put("ADD", new ArrayList<String>());
-      operationGroups.put("DELETE", new ArrayList<String>());
-      operationGroups.put("REPLACE", new ArrayList<String>());
+      // Enhanced format supports JSON: userId::operationType::DN::{"attr1":"val1","deleteUser":"true"}
+      Map<String, List<MemberMappingData>> operationGroups = new java.util.HashMap<>();
+      operationGroups.put("ADD", new ArrayList<>());
+      operationGroups.put("DELETE", new ArrayList<>());
+      operationGroups.put("REPLACE", new ArrayList<>());
       
       for (String mapping : memberMappings)
       {
-        // Parse format: userId::operationType::DN
-        String[] parts = mapping.split("::", 3);
-        if (parts.length == 3)
+        // Parse format: userId::operationType::DN or userId::operationType::DN::{JSON}
+        String[] parts = mapping.split("::", 4);
+        if (parts.length >= 3)
         {
           String userId = parts[0];
           String operationType = parts[1];
           String dn = parts[2];
+          String jsonData = parts.length > 3 ? parts[3] : null;
+          
+          MemberMappingData data = new MemberMappingData(userId, operationType, dn, jsonData);
           
           if (operationGroups.containsKey(operationType))
           {
-            operationGroups.get(operationType).add(userId);
-            operation.logInfo("Parsed mapping: userId=" + userId + ", operation=" + operationType + ", dn=" + dn);
+            operationGroups.get(operationType).add(data);
+            operation.logInfo("Parsed mapping: userId=" + userId + ", operation=" + operationType + 
+                            ", dn=" + dn + ", hasJson=" + (jsonData != null));
           }
           else
           {
@@ -451,33 +526,30 @@ public class StaticGroupMemberDestination extends SyncDestination
         }
         else
         {
-          operation.logInfo("WARNING: Invalid mapping format (expected 3 parts): " + mapping);
+          operation.logInfo("WARNING: Invalid mapping format (expected at least 3 parts): " + mapping);
         }
       }
       
       // Process each operation type
       if (!operationGroups.get("ADD").isEmpty())
       {
-        List<String> userIds = operationGroups.get("ADD");
-        operation.logInfo("Processing ADD operation with " + userIds.size() + " members");
-        processGroupMemberAdditions(scim2GroupId, groupName, 
-            userIds.toArray(new String[0]), operation);
+        List<MemberMappingData> mappings = operationGroups.get("ADD");
+        operation.logInfo("Processing ADD operation with " + mappings.size() + " members");
+        processGroupMemberAdditionsEnhanced(scim2GroupId, groupName, mappings, operation);
       }
       
       if (!operationGroups.get("DELETE").isEmpty())
       {
-        List<String> userIds = operationGroups.get("DELETE");
-        operation.logInfo("Processing DELETE operation with " + userIds.size() + " members");
-        processGroupMemberDeletions(scim2GroupId, groupName, 
-            userIds.toArray(new String[0]), operation);
+        List<MemberMappingData> mappings = operationGroups.get("DELETE");
+        operation.logInfo("Processing DELETE operation with " + mappings.size() + " members");
+        processGroupMemberDeletionsEnhanced(scim2GroupId, groupName, mappings, operation);
       }
       
       if (!operationGroups.get("REPLACE").isEmpty())
       {
-        List<String> userIds = operationGroups.get("REPLACE");
-        operation.logInfo("Processing REPLACE operation with " + userIds.size() + " members (full resync)");
-        processGroupResync(scim2GroupId, groupName, 
-            userIds.toArray(new String[0]), operation);
+        List<MemberMappingData> mappings = operationGroups.get("REPLACE");
+        operation.logInfo("Processing REPLACE operation with " + mappings.size() + " members (full resync)");
+        processGroupResyncEnhanced(scim2GroupId, groupName, mappings, operation);
       }
       
       return;  // Done processing static group with enhanced memberMappings
@@ -928,29 +1000,264 @@ public class StaticGroupMemberDestination extends SyncDestination
         connectTimeout, readTimeout);
   }
 
+  // ===== ENHANCED METHODS WITH USER CREATION/DELETION SUPPORT =====
+  
+  /**
+   * Enhanced version that handles user creation when 404 occurs.
+   */
+  private void processGroupMemberAdditionsEnhanced(
+      final String scim2GroupId,
+      final String groupName,
+      final List<MemberMappingData> mappings,
+      final SyncOperation operation)
+      throws EndpointException
+  {
+    if (mappings == null || mappings.isEmpty())
+    {
+      operation.logInfo("No members to add");
+      return;
+    }
+
+    operation.logInfo("Processing " + mappings.size() + " enhanced member additions for: " + groupName);
+
+    // Convert to SCIM2 members, creating users as needed
+    List<Member> scim2Members = new ArrayList<>();
+    
+    for (MemberMappingData mapping : mappings)
+    {
+      String userId = mapping.userId;
+      
+      // Try to resolve user
+      String scim2UserId = memberHelper.findScim2UserId(userId, operation);
+      
+      if (scim2UserId == null && mapping.userAttributes != null && !mapping.userAttributes.isEmpty())
+      {
+        // User not found, try to create it
+        operation.logInfo("User " + userId + " not found, attempting to create from JSON data");
+        
+        boolean created = userCreationHelper.createUserFromAttributes(userId, mapping.userAttributes, operation);
+        if (created)
+        {
+          // Retry resolution after creation
+          scim2UserId = memberHelper.findScim2UserId(userId, operation);
+        }
+      }
+      
+      if (scim2UserId != null)
+      {
+        Member member = new Member();
+        member.setValue(scim2UserId);
+        try {
+          member.setRef(new java.net.URI(userBasePath + "/" + scim2UserId));
+        } catch (java.net.URISyntaxException e) {
+          // Continue without $ref
+        }
+        scim2Members.add(member);
+      }
+      else
+      {
+        operation.logInfo("WARNING: Skipping user " + userId + " - could not resolve or create");
+      }
+    }
+
+    if (scim2Members.isEmpty())
+    {
+      operation.logInfo("No valid SCIM2 members found to add");
+      return;
+    }
+
+    // Process in batches
+    int totalMembers = scim2Members.size();
+    int batchCount = (int) Math.ceil((double) totalMembers / staticGroupBatchThreshold);
+
+    operation.logInfo("Adding " + totalMembers + " members in " + batchCount + " batch(es)");
+
+    for (int i = 0; i < batchCount; i++)
+    {
+      int startIdx = i * staticGroupBatchThreshold;
+      int endIdx = Math.min(startIdx + staticGroupBatchThreshold, totalMembers);
+      List<Member> batchMembers = scim2Members.subList(startIdx, endIdx);
+
+      operation.logInfo("Processing batch " + (i + 1) + "/" + batchCount +
+                       " (" + batchMembers.size() + " members)");
+
+      sendPatchAddMembers(scim2GroupId, groupName, batchMembers, operation);
+    }
+
+    operation.logInfo("Successfully added " + totalMembers + " members to group: " + groupName);
+  }
+
+  /**
+   * Enhanced version that handles user deletion when deleteUser flag is set.
+   */
+  private void processGroupMemberDeletionsEnhanced(
+      final String scim2GroupId,
+      final String groupName,
+      final List<MemberMappingData> mappings,
+      final SyncOperation operation)
+      throws EndpointException
+  {
+    if (mappings == null || mappings.isEmpty())
+    {
+      operation.logInfo("No members to remove");
+      return;
+    }
+
+    operation.logInfo("Processing " + mappings.size() + " enhanced member deletions for: " + groupName);
+
+    // Convert to SCIM2 members
+    List<Member> scim2Members = new ArrayList<>();
+    List<String> usersToDelete = new ArrayList<>();
+    
+    for (MemberMappingData mapping : mappings)
+    {
+      String scim2UserId = memberHelper.findScim2UserId(mapping.userId, operation);
+      
+      if (scim2UserId != null)
+      {
+        Member member = new Member();
+        member.setValue(scim2UserId);
+        try {
+          member.setRef(new java.net.URI(userBasePath + "/" + scim2UserId));
+        } catch (java.net.URISyntaxException e) {
+          // Continue without $ref
+        }
+        scim2Members.add(member);
+        
+        // Check if user should be deleted after removal
+        if (mapping.hasDeleteFlag())
+        {
+          usersToDelete.add(mapping.userId);
+          operation.logInfo("User " + mapping.userId + " marked for deletion after group removal");
+        }
+      }
+      else
+      {
+        operation.logInfo("WARNING: User " + mapping.userId + " not found in SCIM2, skipping removal");
+      }
+    }
+
+    if (scim2Members.isEmpty())
+    {
+      operation.logInfo("No valid SCIM2 members found to remove");
+      return;
+    }
+
+    // Process in batches
+    int totalMembers = scim2Members.size();
+    int batchCount = (int) Math.ceil((double) totalMembers / staticGroupBatchThreshold);
+
+    operation.logInfo("Removing " + totalMembers + " members in " + batchCount + " batch(es)");
+
+    for (int i = 0; i < batchCount; i++)
+    {
+      int startIdx = i * staticGroupBatchThreshold;
+      int endIdx = Math.min(startIdx + staticGroupBatchThreshold, totalMembers);
+      List<Member> batchMembers = scim2Members.subList(startIdx, endIdx);
+
+      operation.logInfo("Processing batch " + (i + 1) + "/" + batchCount +
+                       " (" + batchMembers.size() + " members)");
+
+      sendPatchRemoveMembers(scim2GroupId, groupName, batchMembers, operation);
+    }
+
+    operation.logInfo("Successfully removed " + totalMembers + " members from group: " + groupName);
+    
+    // Delete users if flagged
+    for (String userId : usersToDelete)
+    {
+      deleteUserById(userId, operation);
+    }
+  }
+
+  /**
+   * Enhanced version that handles full resync with user creation.
+   */
+  private void processGroupResyncEnhanced(
+      final String scim2GroupId,
+      final String groupName,
+      final List<MemberMappingData> mappings,
+      final SyncOperation operation)
+      throws EndpointException
+  {
+    operation.logInfo("Processing full resync (REPLACE) for group: " + groupName);
+
+    // Convert to user IDs array, creating users as needed
+    List<String> validUserIds = new ArrayList<>();
+    
+    for (MemberMappingData mapping : mappings)
+    {
+      String userId = mapping.userId;
+      
+      // Try to resolve user
+      String scim2UserId = memberHelper.findScim2UserId(userId, operation);
+      
+      if (scim2UserId == null && mapping.userAttributes != null && !mapping.userAttributes.isEmpty())
+      {
+        // User not found, try to create it
+        operation.logInfo("User " + userId + " not found, attempting to create from JSON data");
+        
+        boolean created = userCreationHelper.createUserFromAttributes(userId, mapping.userAttributes, operation);
+        if (created)
+        {
+          // Retry resolution after creation
+          scim2UserId = memberHelper.findScim2UserId(userId, operation);
+        }
+      }
+      
+      if (scim2UserId != null)
+      {
+        validUserIds.add(userId);
+      }
+      else
+      {
+        operation.logInfo("WARNING: Skipping user " + userId + " - could not resolve or create");
+      }
+    }
+
+    operation.logInfo("Resyncing group with " + validUserIds.size() + " members");
+
+    // Use existing processGroupResync method
+    processGroupResync(scim2GroupId, groupName, 
+        validUserIds.toArray(new String[0]), operation);
+  }
+
+  /**
+   * Deletes a user by userId.
+   */
+  private void deleteUserById(String userId, SyncOperation operation)
+  {
+    try
+    {
+      operation.logInfo("Deleting user: " + userId);
+      
+      // Resolve to SCIM2 ID
+      String scim2Id = memberHelper.findScim2UserId(userId, operation);
+      
+      if (scim2Id == null)
+      {
+        operation.logInfo("WARNING: User " + userId + " not found in SCIM2, skipping deletion");
+        return;
+      }
+      
+      // Delete via SCIM2 API using URI
+      java.net.URI deleteUri = new java.net.URI(baseUrl + userBasePath + "/" + scim2Id);
+      scimService.delete(deleteUri);
+      
+      operation.logInfo("Successfully deleted user: " + userId + " (SCIM2 ID: " + scim2Id + ")");
+    }
+    catch (Exception e)
+    {
+      operation.logInfo("ERROR: Failed to delete user " + userId + ": " + e.getMessage());
+    }
+  }
+
   /**
    * Gets a configuration value, with precedence: inline argument > config file > default.
    */
   private String getConfigValue(StringArgument arg, String configKey, String defaultValue)
   {
-    // Check inline argument first
-    if (arg != null && arg.isPresent())
-    {
-      return arg.getValue();
-    }
-    
-    // Check config file
-    if (configFileLoader != null && configKey != null)
-    {
-      String value = configFileLoader.getProperty(configKey);
-      if (value != null)
-      {
-        return value;
-      }
-    }
-    
-    // Return default
-    return defaultValue;
+    return configFileLoader.getValueWithFallback(arg, configKey, defaultValue);
   }
 
   /**
@@ -958,19 +1265,17 @@ public class StaticGroupMemberDestination extends SyncDestination
    */
   private int getConfigValueAsInt(StringArgument arg, String configKey, int defaultValue)
   {
-    String strValue = getConfigValue(arg, configKey, null);
-    if (strValue != null)
+    // Check argument first
+    if (arg != null && arg.isPresent())
     {
-      try
-      {
-        return Integer.parseInt(strValue);
-      }
-      catch (NumberFormatException e)
-      {
-        serverContext.debugInfo("Invalid integer value for " + configKey + ": " + strValue +
-                               ", using default: " + defaultValue);
+      try {
+        return Integer.parseInt(arg.getValue());
+      } catch (NumberFormatException e) {
+        serverContext.debugInfo("Invalid integer value for argument: " + arg.getValue());
       }
     }
-    return defaultValue;
+    
+    // Use ConfigFileLoader's getIntProperty
+    return configFileLoader != null ? configFileLoader.getIntProperty(configKey, defaultValue) : defaultValue;
   }
 }

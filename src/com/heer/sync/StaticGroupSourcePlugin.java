@@ -29,6 +29,7 @@ package com.heer.sync;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -97,6 +98,9 @@ public class StaticGroupSourcePlugin extends LDAPSyncSourcePlugin
   
   private static final String PROP_USER_ID_ATTRIBUTE = "user.id.attribute";
   private static final String PROP_GROUP_FILTER = "group.filter";
+  private static final String PROP_USER_LIFECYCLE_MODE = "user.lifecycle.mode";
+  private static final String PROP_SCIM_USER_ATTRIBUTES = "scim.user.attributes";
+  private static final String PROP_SCIM_USER_MAP_PREFIX = "scim.user.map.";
   
   // The server context for the server in which this extension is running
   private SyncServerContext serverContext;
@@ -112,6 +116,15 @@ public class StaticGroupSourcePlugin extends LDAPSyncSourcePlugin
   
   // Optional LDAP filter to determine which groups should have membership expanded
   private Filter groupFilter;
+  
+  // User lifecycle mode (static-group-memberships or dynamic-group-memberships)
+  private String userLifecycleMode;
+  
+  // SCIM user attributes to map from LDAP
+  private String[] scimUserAttributes;
+  
+  // SCIM user attribute mappings (SCIM attr -> LDAP attr)
+  private Map<String, String> scimUserMappings;
 
   @Override
   public String getExtensionName()
@@ -360,6 +373,36 @@ public class StaticGroupSourcePlugin extends LDAPSyncSourcePlugin
       {
         this.groupFilter = null;
       }
+      
+      // Load user lifecycle mode
+      if (configFileLoader != null)
+      {
+        this.userLifecycleMode = configFileLoader.getProperty(PROP_USER_LIFECYCLE_MODE, "dynamic-group-memberships");
+      }
+      else
+      {
+        this.userLifecycleMode = "dynamic-group-memberships";
+      }
+      
+      // Load SCIM user attributes list
+      if (configFileLoader != null)
+      {
+        this.scimUserAttributes = configFileLoader.getPropertyList(PROP_SCIM_USER_ATTRIBUTES);
+      }
+      else
+      {
+        this.scimUserAttributes = new String[0];
+      }
+      
+      // Load SCIM user attribute mappings
+      if (configFileLoader != null)
+      {
+        this.scimUserMappings = configFileLoader.getPropertyMap(PROP_SCIM_USER_MAP_PREFIX);
+      }
+      else
+      {
+        this.scimUserMappings = new HashMap<String, String>();
+      }
     }
     finally
     {
@@ -393,6 +436,159 @@ public class StaticGroupSourcePlugin extends LDAPSyncSourcePlugin
         "Only processes static groups whose cn starts with 'scim-'.");
 
     return exampleMap;
+  }
+  
+  /**
+   * Builds a JSON-encoded member mapping with user attributes and lifecycle metadata.
+   * 
+   * Format: userId::operationType::DN::{"attr1":"value1","attr2":"value2",...}
+   * 
+   * For ADD/REPLACE operations in static-group-memberships mode:
+   * - Fetches user entry from LDAP
+   * - Includes SCIM attribute mappings for user creation
+   * 
+   * For DELETE operations in static-group-memberships mode:
+   * - Checks isMemberOf to determine if user should be deleted
+   * - Sets deleteUser flag if no other in-scope groups remain
+   * 
+   * @param sourceConnection LDAP connection to fetch user details
+   * @param userId The user ID extracted from DN
+   * @param operationType ADD, DELETE, or REPLACE
+   * @param dn The user's LDAP DN
+   * @param operation Sync operation for logging
+   * @return JSON-encoded member mapping string
+   */
+  private String buildMemberMapping(final LDAPInterface sourceConnection,
+                                    final String userId,
+                                    final String operationType,
+                                    final String dn,
+                                    final SyncOperation operation)
+  {
+    // Basic format without user attributes
+    String basicMapping = userId + "::" + operationType + "::" + dn;
+    
+    // If no SCIM user attributes configured, return basic format
+    if (scimUserAttributes == null || scimUserAttributes.length == 0)
+    {
+      return basicMapping;
+    }
+    
+    try
+    {
+      Map<String, String> userData = new HashMap<String, String>();
+      
+      // For ADD/REPLACE in static-group-memberships mode, fetch user attributes for creation
+      if ("static-group-memberships".equalsIgnoreCase(userLifecycleMode) &&
+          ("ADD".equals(operationType) || "REPLACE".equals(operationType)))
+      {
+        // Build list of LDAP attributes to fetch
+        List<String> ldapAttrsToFetch = new ArrayList<String>();
+        for (String scimAttr : scimUserAttributes)
+        {
+          String ldapAttr = scimUserMappings.get(scimAttr);
+          if (ldapAttr != null && !ldapAttr.isEmpty())
+          {
+            ldapAttrsToFetch.add(ldapAttr);
+          }
+        }
+        
+        if (!ldapAttrsToFetch.isEmpty())
+        {
+          // Fetch user entry with required attributes
+          Entry userEntry = sourceConnection.getEntry(dn, ldapAttrsToFetch.toArray(new String[0]));
+          if (userEntry != null)
+          {
+            // Map LDAP attributes to SCIM attributes
+            for (String scimAttr : scimUserAttributes)
+            {
+              String ldapAttr = scimUserMappings.get(scimAttr);
+              if (ldapAttr != null)
+              {
+                String value = userEntry.getAttributeValue(ldapAttr);
+                if (value != null && !value.isEmpty())
+                {
+                  userData.put(scimAttr, value);
+                }
+              }
+            }
+            LoggingHelper.logDebug(serverContext,
+                "Fetched " + userData.size() + " user attributes for " + userId);
+          }
+        }
+      }
+      
+      // For DELETE in static-group-memberships mode, check isMemberOf
+      if ("static-group-memberships".equalsIgnoreCase(userLifecycleMode) &&
+          "DELETE".equals(operationType) && groupFilter != null)
+      {
+        // Fetch user's isMemberOf attribute
+        Entry userEntry = sourceConnection.getEntry(dn, "isMemberOf");
+        if (userEntry != null)
+        {
+          String[] memberOfDNs = userEntry.getAttributeValues("isMemberOf");
+          boolean hasOtherInScopeGroups = false;
+          
+          if (memberOfDNs != null && memberOfDNs.length > 0)
+          {
+            // Check if any remaining groups match group.filter
+            for (String groupDN : memberOfDNs)
+            {
+              try
+              {
+                Entry groupEntry = sourceConnection.getEntry(groupDN, "*");
+                if (groupEntry != null && groupFilter.matchesEntry(groupEntry))
+                {
+                  hasOtherInScopeGroups = true;
+                  break;
+                }
+              }
+              catch (LDAPException e)
+              {
+                LoggingHelper.logDebug(serverContext,
+                    "Error checking group " + groupDN + ": " + e.getMessage());
+              }
+            }
+          }
+          
+          // If no other in-scope groups, mark user for deletion
+          if (!hasOtherInScopeGroups)
+          {
+            userData.put("deleteUser", "true");
+            LoggingHelper.logInfo(operation,
+                "User " + userId + " has no other in-scope groups - marked for deletion");
+          }
+        }
+      }
+      
+      // Build JSON string for user data
+      if (!userData.isEmpty())
+      {
+        StringBuilder json = new StringBuilder("{");
+        boolean first = true;
+        for (Map.Entry<String, String> entry : userData.entrySet())
+        {
+          if (!first)
+          {
+            json.append(",");
+          }
+          first = false;
+          // Simple JSON encoding - escape quotes and backslashes
+          String key = entry.getKey().replace("\\", "\\\\").replace("\"", "\\\"");
+          String value = entry.getValue().replace("\\", "\\\\").replace("\"", "\\\"");
+          json.append("\"").append(key).append("\":\"").append(value).append("\"");
+        }
+        json.append("}");
+        
+        return basicMapping + "::" + json.toString();
+      }
+    }
+    catch (LDAPException e)
+    {
+      LoggingHelper.logInfo(operation,
+          "Error fetching user details for " + dn + ": " + e.getMessage());
+    }
+    
+    return basicMapping;
   }
 
   @Override
@@ -553,8 +749,8 @@ public class StaticGroupSourcePlugin extends LDAPSyncSourcePlugin
                       sourceConnection, dn, userIdAttribute, operation);
                   if (userId != null)
                   {
-                    // Format: userId::operationType::DN
-                    String mapping = userId + "::" + operationType + "::" + dn;
+                    // Build JSON mapping with user attributes and lifecycle metadata
+                    String mapping = buildMemberMapping(sourceConnection, userId, operationType, dn, operation);
                     memberMappings.add(mapping);
                     LoggingHelper.logInfo(operation,
                         "Added mapping: " + mapping);
@@ -589,8 +785,7 @@ public class StaticGroupSourcePlugin extends LDAPSyncSourcePlugin
                   sourceConnection, memberDN, userIdAttribute, operation);
               if (userId != null)
               {
-                // Format: userId::REPLACE::DN
-                String mapping = userId + "::REPLACE::" + memberDN;
+                String mapping = buildMemberMapping(sourceConnection, userId, "REPLACE", memberDN, operation);
                 memberMappings.add(mapping);
               }
             }
@@ -604,8 +799,7 @@ public class StaticGroupSourcePlugin extends LDAPSyncSourcePlugin
                   sourceConnection, uniqueMemberDN, userIdAttribute, operation);
               if (userId != null)
               {
-                // Format: userId::REPLACE::DN
-                String mapping = userId + "::REPLACE::" + uniqueMemberDN;
+                String mapping = buildMemberMapping(sourceConnection, userId, "REPLACE", uniqueMemberDN, operation);
                 memberMappings.add(mapping);
               }
             }
@@ -631,7 +825,8 @@ public class StaticGroupSourcePlugin extends LDAPSyncSourcePlugin
                 sourceConnection, memberDN, userIdAttribute, operation);
             if (userId != null)
             {
-              memberMappings.add(userId + "::REPLACE::" + memberDN);
+              String mapping = buildMemberMapping(sourceConnection, userId, "REPLACE", memberDN, operation);
+              memberMappings.add(mapping);
             }
           }
         }
@@ -644,7 +839,8 @@ public class StaticGroupSourcePlugin extends LDAPSyncSourcePlugin
                 sourceConnection, uniqueMemberDN, userIdAttribute, operation);
             if (userId != null)
             {
-              memberMappings.add(userId + "::REPLACE::" + uniqueMemberDN);
+              String mapping = buildMemberMapping(sourceConnection, userId, "REPLACE", uniqueMemberDN, operation);
+              memberMappings.add(mapping);
             }
           }
         }

@@ -319,6 +319,40 @@ public class UserGroupMembershipSourcePlugin extends LDAPSyncSourcePlugin
         return PostStepResult.ABORT_OPERATION;
       }
       
+      // Handle ADD operations (user creation with group membership attributes)
+      if ("add".equalsIgnoreCase(changelogEntry.getChangeType().getName()))
+      {
+        // Check if the new entry has any group membership attributes with values
+        boolean hasGroupMembershipAttributes = false;
+        for (String groupAttr : groupMembershipAttributes)
+        {
+          String[] values = entry.getAttributeValues(groupAttr);
+          if (values != null && values.length > 0)
+          {
+            hasGroupMembershipAttributes = true;
+            LoggingHelper.logInfo(operation,
+                "UserGroupMembershipSourcePlugin: New user " + entry.getDN() + 
+                " has group membership attribute " + groupAttr + " with " + values.length + " values");
+            break;
+          }
+        }
+        
+        if (hasGroupMembershipAttributes)
+        {
+          LoggingHelper.logInfo(operation,
+              "UserGroupMembershipSourcePlugin: User " + entry.getDN() + 
+              " created with group memberships - allowed");
+          return PostStepResult.CONTINUE;
+        }
+        else
+        {
+          LoggingHelper.logInfo(operation,
+              "UserGroupMembershipSourcePlugin: User " + entry.getDN() + 
+              " created without group memberships - filtered");
+          return PostStepResult.ABORT_OPERATION;
+        }
+      }
+      
       // Check if any modification is to a group membership attribute
       List<Modification> modifications = changelogEntry.getModifications();
       if (modifications == null || modifications.isEmpty())
@@ -330,6 +364,8 @@ public class UserGroupMembershipSourcePlugin extends LDAPSyncSourcePlugin
       }
       
       boolean hasGroupMembershipChange = false;
+      boolean allGroupAttributesBecomingEmpty = true;
+      
       for (Modification mod : modifications)
       {
         String attrName = mod.getAttributeName().toLowerCase();
@@ -339,7 +375,94 @@ public class UserGroupMembershipSourcePlugin extends LDAPSyncSourcePlugin
           LoggingHelper.logInfo(operation, 
               "UserGroupMembershipSourcePlugin: Detected change to group membership attribute: " + 
               attrName);
-          break;
+          
+          // Check if this attribute still has values after the modification
+          // If DELETE or REPLACE with empty values, this attribute becomes empty
+          if (mod.getModificationType() == com.unboundid.ldap.sdk.ModificationType.DELETE)
+          {
+            // DELETE modification
+            // Check if this is deleting all values or specific values
+            if (mod.getValues().length == 0)
+            {
+              // DELETE with no values = delete all values from this attribute
+              LoggingHelper.logInfo(operation,
+                  "UserGroupMembershipSourcePlugin: Attribute " + attrName + 
+                  " is being emptied (DELETE all)");
+            }
+            else
+            {
+              // DELETE specific values - need to check if any values remain
+              // Check current entry to see if there are remaining values
+              String[] currentValues = entry.getAttributeValues(attrName);
+              String[] deletedValues = mod.getValues();
+              
+              boolean hasRemainingValues = false;
+              if (currentValues != null && currentValues.length > 0)
+              {
+                for (String currentVal : currentValues)
+                {
+                  boolean isDeleted = false;
+                  for (String deletedVal : deletedValues)
+                  {
+                    if (currentVal.equalsIgnoreCase(deletedVal))
+                    {
+                      isDeleted = true;
+                      break;
+                    }
+                  }
+                  if (!isDeleted)
+                  {
+                    hasRemainingValues = true;
+                    break;
+                  }
+                }
+              }
+              
+              if (hasRemainingValues)
+              {
+                allGroupAttributesBecomingEmpty = false;
+                LoggingHelper.logInfo(operation,
+                    "UserGroupMembershipSourcePlugin: Attribute " + attrName + 
+                    " still has values after partial DELETE");
+              }
+              else
+              {
+                LoggingHelper.logInfo(operation,
+                    "UserGroupMembershipSourcePlugin: Attribute " + attrName + 
+                    " is being emptied (DELETE specific values)");
+              }
+            }
+          }
+          else if (mod.getModificationType() == com.unboundid.ldap.sdk.ModificationType.REPLACE)
+          {
+            // REPLACE modification
+            if (mod.getValues().length == 0)
+            {
+              LoggingHelper.logInfo(operation,
+                  "UserGroupMembershipSourcePlugin: Attribute " + attrName + 
+                  " is being emptied (REPLACE with no values)");
+            }
+            else
+            {
+              allGroupAttributesBecomingEmpty = false;
+              LoggingHelper.logInfo(operation,
+                  "UserGroupMembershipSourcePlugin: Attribute " + attrName + 
+                  " still has values after REPLACE");
+            }
+          }
+          else if (mod.getModificationType() == com.unboundid.ldap.sdk.ModificationType.ADD)
+          {
+            // ADD modification - values are being added, so attribute is not becoming empty
+            allGroupAttributesBecomingEmpty = false;
+            LoggingHelper.logInfo(operation,
+                "UserGroupMembershipSourcePlugin: Attribute " + attrName + 
+                " has values being added");
+          }
+          else
+          {
+            // Other modification types (INCREMENT) - assume not emptying
+            allGroupAttributesBecomingEmpty = false;
+          }
         }
       }
       
@@ -349,6 +472,74 @@ public class UserGroupMembershipSourcePlugin extends LDAPSyncSourcePlugin
             "UserGroupMembershipSourcePlugin: User " + entry.getDN() + 
             " has no group membership changes - filtered");
         return PostStepResult.ABORT_OPERATION;
+      }
+      
+      // Check if user should be deleted (all group membership attributes becoming empty)
+      // Also verify the attributes exist and are actually becoming empty
+      boolean shouldDeleteUser = allGroupAttributesBecomingEmpty;
+      if (shouldDeleteUser)
+      {
+        // Verify that we actually found group membership attributes in the modifications
+        // and that they're all becoming empty (not just no modifications)
+        int foundGroupAttrCount = 0;
+        for (Modification mod : modifications)
+        {
+          String attrName = mod.getAttributeName().toLowerCase();
+          if (groupMembershipAttributes.contains(attrName))
+          {
+            foundGroupAttrCount++;
+          }
+        }
+        
+        // Only delete if we found at least one group attribute being modified
+        if (foundGroupAttrCount == 0)
+        {
+          shouldDeleteUser = false;
+        }
+        
+        // Also check if there are OTHER group membership attributes (not in modifications)
+        // that still have values in the current entry
+        for (String groupAttr : groupMembershipAttributes)
+        {
+          boolean foundInMods = false;
+          for (Modification mod : modifications)
+          {
+            if (mod.getAttributeName().equalsIgnoreCase(groupAttr))
+            {
+              foundInMods = true;
+              break;
+            }
+          }
+          
+          if (!foundInMods)
+          {
+            // This group attribute was not modified, check if it has values
+            String[] values = entry.getAttributeValues(groupAttr);
+            if (values != null && values.length > 0)
+            {
+              shouldDeleteUser = false;
+              LoggingHelper.logInfo(operation,
+                  "UserGroupMembershipSourcePlugin: Attribute " + groupAttr + 
+                  " not modified but still has " + values.length + " values - user should not be deleted");
+              break;
+            }
+          }
+        }
+      }
+      
+      if (shouldDeleteUser)
+      {
+        LoggingHelper.logInfo(operation,
+            "UserGroupMembershipSourcePlugin: User " + entry.getDN() + 
+            " is being removed from all groups - marking for deletion");
+        
+        // Add synthetic attribute to flag user for deletion
+        Entry modifiedEntry = entry.duplicate();
+        modifiedEntry.addAttribute("scimUserDeleteFlag", "true");
+        fetchedEntryRef.set(modifiedEntry);
+        
+        // Mark the attribute as modified so destination will see it
+        operation.addModifiedDestinationAttribute("scimUserDeleteFlag");
       }
       
       LoggingHelper.logInfo(operation, 

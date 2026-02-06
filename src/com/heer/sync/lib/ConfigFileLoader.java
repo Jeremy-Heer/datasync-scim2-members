@@ -31,6 +31,8 @@ import java.io.FileInputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.attribute.FileTime;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
@@ -190,6 +192,37 @@ public class ConfigFileLoader
   }
   
   /**
+   * Gets a configuration value with fallback priority: argument > config file > default.
+   * This utility method consolidates the common pattern of checking command-line arguments
+   * first, then configuration file properties, then falling back to a default value.
+   * 
+   * @param arg The StringArgument from ArgumentParser (may be null)
+   * @param configKey The configuration file property key
+   * @param defaultValue The default value if not found in argument or config
+   * @return The configuration value using the priority chain
+   */
+  public String getValueWithFallback(final com.unboundid.util.args.StringArgument arg,
+                                     final String configKey,
+                                     final String defaultValue)
+  {
+    // Priority 1: Command-line argument
+    if (arg != null && arg.isPresent())
+    {
+      return arg.getValue();
+    }
+    
+    // Priority 2: Configuration file property
+    String value = getProperty(configKey);
+    if (value != null && !value.trim().isEmpty())
+    {
+      return value;
+    }
+    
+    // Priority 3: Default value
+    return defaultValue;
+  }
+  
+  /**
    * Checks if the configuration file has been modified since last load,
    * and reloads it if necessary.
    */
@@ -322,5 +355,87 @@ public class ConfigFileLoader
     {
       readLock.unlock();
     }
+  }
+  
+  /**
+   * Gets all properties with a given prefix as a map.
+   * This is useful for retrieving map-style properties like:
+   *   scim.user.map.userName=uid
+   *   scim.user.map.name.formatted=cn
+   *   scim.user.map.name.familyName=sn
+   * 
+   * Given prefix "scim.user.map.", returns:
+   *   {"userName": "uid", "name.formatted": "cn", "name.familyName": "sn"}
+   * 
+   * @param prefix The property key prefix (must include trailing delimiter like ".")
+   * @return Map of keys (without prefix) to values, or empty map if none found
+   */
+  public Map<String, String> getPropertyMap(final String prefix)
+  {
+    checkAndReloadIfModified();
+    
+    Map<String, String> result = new HashMap<String, String>();
+    
+    readLock.lock();
+    try
+    {
+      for (String key : properties.stringPropertyNames())
+      {
+        if (key.startsWith(prefix))
+        {
+          String suffix = key.substring(prefix.length());
+          String value = properties.getProperty(key);
+          if (value != null && !value.trim().isEmpty())
+          {
+            result.put(suffix, value.trim());
+          }
+        }
+      }
+    }
+    finally
+    {
+      readLock.unlock();
+    }
+    
+    return result;
+  }
+  
+  /**
+   * Gets a comma-separated property value as a list of strings.
+   * Each value is trimmed of whitespace.
+   * 
+   * @param key The property key
+   * @return Array of trimmed values, or empty array if property not found
+   */
+  public String[] getPropertyList(final String key)
+  {
+    String value = getProperty(key);
+    if (value == null || value.trim().isEmpty())
+    {
+      return new String[0];
+    }
+    
+    String[] parts = value.split(",");
+    String[] result = new String[parts.length];
+    int count = 0;
+    
+    for (String part : parts)
+    {
+      String trimmed = part.trim();
+      if (!trimmed.isEmpty())
+      {
+        result[count++] = trimmed;
+      }
+    }
+    
+    // Resize array if we skipped empty values
+    if (count < result.length)
+    {
+      String[] resized = new String[count];
+      System.arraycopy(result, 0, resized, 0, count);
+      return resized;
+    }
+    
+    return result;
   }
 }

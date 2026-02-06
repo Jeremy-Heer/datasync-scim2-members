@@ -42,6 +42,79 @@ user.id.attribute=uid
 group.membership.attributes=scim-groups
 
 # ==============================================================================
+# USER LIFECYCLE MANAGEMENT CONFIGURATION
+# ==============================================================================
+
+# User lifecycle mode - determines when users are created/deleted in SCIM2 destination
+# Valid values:
+#   dynamic-group-memberships - Users scoped by dynamic group membership
+#                               User created when they appear in memberURL query results
+#                               Requires scim.user.attributes and scim.user.map.* configuration
+#   static-group-memberships  - Users scoped by membership in groups matching group.filter
+#                               User created when added to any group matching group.filter
+#                               User deleted when removed from all groups matching group.filter
+# Default: Not set (user creation disabled)
+# OPTIONAL
+# user.lifecycle.mode=dynamic-group-memberships
+
+# ==============================================================================
+# SCIM2 ATTRIBUTE MAPPING CONFIGURATION
+# ==============================================================================
+
+# SCIM2 User Attributes - Comma-separated list of SCIM2 attributes to populate on user creation
+# Use dot notation for nested attributes (e.g., name.formatted, name.familyName)
+# These attributes will be mapped from LDAP using scim.user.map.* properties below
+# REQUIRED (for user creation in StaticGroupMemberDestination and DynamicGroupMemberDestination)
+# 
+# Example for static groups:
+#   scim.user.attributes=userName,name.formatted,name.familyName,name.givenName,displayName,emails.work.value
+#
+# Example for dynamic groups with user creation enabled:
+#   scim.user.attributes=userName,name.formatted,name.familyName,name.givenName,displayName
+#
+# NOTE: When user.lifecycle.mode=dynamic-group-memberships is set, DynamicGroupSourcePlugin will
+#       fetch these LDAP attributes from each member user and include them in the memberMappings
+#       attribute. DynamicGroupMemberDestination will then use this data to create missing users.
+#
+# scim.user.attributes=userName,name.formatted,name.familyName,name.givenName,displayName,emails.work.value
+
+# SCIM2 User Attribute Mappings - Maps SCIM2 attributes to LDAP attributes
+# Format: scim.user.map.<scim-attribute>=<ldap-attribute>
+# For nested SCIM attributes, use dot notation in the property name
+# REQUIRED when scim.user.attributes is specified
+#
+# Examples:
+#   scim.user.map.userName=uid
+#   scim.user.map.name.formatted=cn
+#   scim.user.map.name.familyName=sn
+#   scim.user.map.name.givenName=givenName
+#   scim.user.map.displayName=displayName
+#   scim.user.map.emails.work.value=mail
+#
+# REQUIRED (for UserBasicCrudDestination, StaticGroupMemberDestination, and DynamicGroupMemberDestination user creation)
+# scim.user.map.userName=uid
+# scim.user.map.name.formatted=cn
+# scim.user.map.name.familyName=sn
+# scim.user.map.name.givenName=givenName
+# scim.user.map.displayName=displayName
+# scim.user.map.emails.work.value=mail
+
+# SCIM2 Group Attributes - Comma-separated list of SCIM2 attributes to populate on group creation
+# Use dot notation for nested attributes if needed
+# These attributes will be mapped from LDAP using scim.group.map.* properties below
+# REQUIRED (for GroupBasicCrudDestination)
+# scim.group.attributes=displayName,externalId
+
+# SCIM2 Group Attribute Mappings - Maps SCIM2 attributes to LDAP attributes
+# Format: scim.group.map.<scim-attribute>=<ldap-attribute>
+# Examples:
+#   scim.group.map.displayName=cn
+#   scim.group.map.externalId=entryUUID
+# REQUIRED (for GroupBasicCrudDestination)
+# scim.group.map.displayName=cn
+# scim.group.map.externalId=entryUUID
+
+# ==============================================================================
 # SCIM2 DESTINATION CONFIGURATION  
 # ==============================================================================
 
@@ -73,6 +146,33 @@ group.membership.attributes=scim-groups
 # Bearer Token Authentication (if auth.type=bearer)
 # REQUIRED (if using bearer auth)
 # scim2.bearer.token=your-bearer-token-here
+
+# ==============================================================================
+# DYNAMIC GROUP DESTINATION CONFIGURATION
+# ==============================================================================
+
+# Dynamic group synchronization with automatic user creation support
+# When user.lifecycle.mode=dynamic-group-memberships is configured along with
+# scim.user.attributes and scim.user.map.* properties, DynamicGroupMemberDestination
+# will automatically create users that don't exist in SCIM2 before adding them to groups.
+#
+# The DynamicGroupSourcePlugin fetches member users from memberURL queries and includes
+# their LDAP attributes in an enhanced memberMappings attribute. The destination plugin
+# parses this data and creates users as needed.
+#
+# Configuration example for dynamic groups with user creation:
+#   user.lifecycle.mode=dynamic-group-memberships
+#   scim.user.attributes=userName,name.familyName,name.givenName,displayName
+#   scim.user.map.userName=uid
+#   scim.user.map.name.familyName=sn
+#   scim.user.map.name.givenName=givenName
+#   scim.user.map.displayName=displayName
+
+# The LDAP attribute used to look up users in SCIM2
+# This should match the user ID values extracted from memberURL queries
+# Default: uid
+# OPTIONAL
+# user.lookup.attribute=uid
 
 # ==============================================================================
 # STATIC GROUP DESTINATION CONFIGURATION

@@ -7,6 +7,7 @@ package com.heer.sync;
 import com.unboundid.directory.sdk.sync.api.SyncDestination;
 import com.unboundid.directory.sdk.sync.config.SyncDestinationConfig;
 import com.unboundid.directory.sdk.sync.types.EndpointException;
+import com.unboundid.directory.sdk.sync.types.PostStepResult;
 import com.unboundid.directory.sdk.sync.types.SyncOperation;
 import com.unboundid.directory.sdk.sync.types.SyncServerContext;
 import com.unboundid.ldap.sdk.Attribute;
@@ -399,22 +400,7 @@ public class UserGroupMembershipDestination extends SyncDestination
                                  final String configPropertyName, final String defaultValue)
   {
     StringArgument arg = (StringArgument) parser.getNamedArgument(argName);
-    
-    // Check command-line argument first
-    if (arg != null && arg.isPresent()) {
-      return arg.getValue();
-    }
-    
-    // Check config file using the config property name
-    if (configLoader != null) {
-      String value = configLoader.getProperty(configPropertyName);
-      if (value != null && !value.trim().isEmpty()) {
-        return value;
-      }
-    }
-    
-    // Return default
-    return defaultValue;
+    return configLoader.getValueWithFallback(arg, configPropertyName, defaultValue);
   }
   
   @Override
@@ -462,14 +448,24 @@ public class UserGroupMembershipDestination extends SyncDestination
     // Search for corresponding SCIM2 user
     String scim2UserId = memberHelper.findScim2UserId(username, operation);
     if (scim2UserId == null) {
-      operation.logInfo("fetchEntry - SCIM2 user not found: " + username);
-      return Arrays.asList();
+      operation.logInfo("fetchEntry - SCIM2 user not found: " + username + 
+                       " - will retry after User CRUD pipe creates the user");
+      throw new EndpointException(PostStepResult.RETRY_OPERATION_LIMITED,
+          "SCIM2 user not found: " + username + ". User may not exist yet - " +
+          "retrying to allow User CRUD pipe to create the user first.");
     }
     
     // Create synthetic entry with user details
     Entry syntheticEntry = new Entry(destEntryMappedFromSrc.getDN());
     syntheticEntry.addAttribute(usernameLookupAttribute, username);
     syntheticEntry.addAttribute("scim2UserId", scim2UserId);
+    
+    // Preserve scimUserDeleteFlag from source plugin if present
+    Attribute deleteFlag = destEntryMappedFromSrc.getAttribute("scimUserDeleteFlag");
+    if (deleteFlag != null) {
+      syntheticEntry.addAttribute(deleteFlag);
+      operation.logInfo("fetchEntry - Preserving scimUserDeleteFlag for user: " + username);
+    }
     
     // Populate current group memberships from SCIM2
     populateCurrentGroupMemberships(syntheticEntry, scim2UserId, operation);
@@ -589,10 +585,32 @@ public class UserGroupMembershipDestination extends SyncDestination
       return;
     }
     
+    // Check for user deletion flag (from UserGroupMembershipSourcePlugin)
+    Attribute deleteFlag = entryToModify.getAttribute("scimUserDeleteFlag");
+    boolean shouldDeleteUser = deleteFlag != null && 
+        "true".equalsIgnoreCase(deleteFlag.getValue());
+    
+    if (shouldDeleteUser) {
+      operation.logInfo("User " + username + " flagged for deletion after group membership removal");
+    }
+    
     // Process each group membership modification
     for (Modification mod : modsToApply) {
       if (isGroupMembershipModification(mod)) {
         processGroupMembershipModification(mod, scim2UserId, operation);
+      }
+    }
+    
+    // Delete user if flagged
+    if (shouldDeleteUser) {
+      operation.logInfo("Deleting user " + username + " from SCIM2 after removing from all groups");
+      try {
+        java.net.URI deleteUri = new java.net.URI(baseUrl + userBasePath + "/" + scim2UserId);
+        scimService.delete(deleteUri);
+        operation.logInfo("Successfully deleted user: " + username + " (SCIM2 ID: " + scim2UserId + ")");
+      } catch (Exception e) {
+        operation.logInfo("ERROR: Failed to delete user " + username + ": " + e.getMessage());
+        throw new RuntimeException("Failed to delete user from SCIM2", e);
       }
     }
     
@@ -867,29 +885,7 @@ public class UserGroupMembershipDestination extends SyncDestination
   private void addUserToScim2Group(final String groupId, final String userId,
       final SyncOperation operation) throws Exception
   {
-    try {
-      // Use PATCH operation to add member
-      String patchJson = createAddMemberPatchJson(userId);
-      
-      jakarta.ws.rs.client.Client client = clientFactory.createJaxrsClient();
-      jakarta.ws.rs.client.WebTarget target = client.target(baseUrl + groupBasePath + "/" + groupId);
-      jakarta.ws.rs.core.Response response = target.request("application/scim+json")
-          .method("PATCH", jakarta.ws.rs.client.Entity.entity(patchJson, "application/scim+json"));
-      
-      if (response.getStatus() >= 200 && response.getStatus() < 300) {
-        operation.logInfo("Added user " + userId + " to group " + groupId);
-      } else {
-        String errorBody = response.hasEntity() ? response.readEntity(String.class) : "No response body";
-        throw new RuntimeException("PATCH request failed with status: " + response.getStatus() + 
-                               " - " + errorBody);
-      }
-      response.close();
-      client.close();
-      
-    } catch (Exception e) {
-      operation.logInfo("Error adding user " + userId + " to group " + groupId + ": " + e.getMessage());
-      throw e;
-    }
+    memberHelper.addUserToGroup(groupId, userId, baseUrl, operation);
   }
   
   /**
@@ -898,48 +894,6 @@ public class UserGroupMembershipDestination extends SyncDestination
   private void removeUserFromScim2Group(final String groupId, final String userId,
       final SyncOperation operation) throws Exception
   {
-    try {
-      // Use PATCH operation to remove member
-      String patchJson = createRemoveMemberPatchJson(userId);
-      
-      jakarta.ws.rs.client.Client client = clientFactory.createJaxrsClient();
-      jakarta.ws.rs.client.WebTarget target = client.target(baseUrl + groupBasePath + "/" + groupId);
-      jakarta.ws.rs.core.Response response = target.request("application/scim+json")
-          .method("PATCH", jakarta.ws.rs.client.Entity.entity(patchJson, "application/scim+json"));
-      
-      if (response.getStatus() >= 200 && response.getStatus() < 300) {
-        operation.logInfo("Removed user " + userId + " from group " + groupId);
-      } else {
-        String errorBody = response.hasEntity() ? response.readEntity(String.class) : "No response body";
-        throw new RuntimeException("PATCH request failed with status: " + response.getStatus() + 
-                               " - " + errorBody);
-      }
-      response.close();
-      client.close();
-      
-    } catch (Exception e) {
-      operation.logInfo("Error removing user " + userId + " from group " + groupId + ": " + e.getMessage());
-      throw e;
-    }
-  }
-  
-  /**
-   * Creates JSON for PATCH operation to add a member.
-   */
-  private String createAddMemberPatchJson(final String userId) throws Exception
-  {
-    return "{\"schemas\":[\"urn:ietf:params:scim:api:messages:2.0:PatchOp\"]," +
-           "\"Operations\":[{\"op\":\"add\",\"path\":\"members\"," +
-           "\"value\":[{\"value\":\"" + userId + "\"}]}]}";
-  }
-  
-  /**
-   * Creates JSON for PATCH operation to remove a member.
-   */
-  private String createRemoveMemberPatchJson(final String userId) throws Exception
-  {
-    return "{\"schemas\":[\"urn:ietf:params:scim:api:messages:2.0:PatchOp\"]," +
-           "\"Operations\":[{\"op\":\"remove\",\"path\":\"members[value eq \\\"" + 
-           userId + "\\\"]\"}]}";
+    memberHelper.removeUserFromGroup(groupId, userId, baseUrl, operation);
   }
 }

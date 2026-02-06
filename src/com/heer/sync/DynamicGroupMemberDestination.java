@@ -24,6 +24,8 @@ import com.unboundid.util.args.StringArgument;
 import com.unboundid.scim2.client.ScimService;
 import com.unboundid.scim2.common.types.GroupResource;
 import com.unboundid.scim2.common.types.Member;
+import com.unboundid.scim2.common.types.Name;
+import com.unboundid.scim2.common.types.UserResource;
 import com.unboundid.scim2.common.utils.JsonUtils;
 
 import jakarta.ws.rs.client.Client;
@@ -33,6 +35,7 @@ import jakarta.ws.rs.core.Response;
 import com.heer.sync.lib.ConfigFileLoader;
 import com.heer.sync.lib.scim2.Scim2ClientFactory;
 import com.heer.sync.lib.scim2.Scim2MemberHelper;
+import com.heer.sync.lib.scim2.Scim2UserCreationHelper;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -40,6 +43,46 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+
+/**
+ * Helper class to hold parsed member mapping data
+ */
+class DynamicMemberMappingData
+{
+  String userId;
+  String operationType;
+  String dn;
+  String jsonData;
+  Map<String, String> userAttributes;
+  
+  public DynamicMemberMappingData(String userId, String operationType, String dn, String jsonData)
+  {
+    this.userId = userId;
+    this.operationType = operationType;
+    this.dn = dn;
+    this.jsonData = jsonData;
+    this.userAttributes = new java.util.HashMap<>();
+    
+    // Parse JSON if present
+    if (jsonData != null && !jsonData.trim().isEmpty())
+    {
+      try
+      {
+        ObjectMapper mapper = JsonUtils.createObjectMapper();
+        @SuppressWarnings("unchecked")
+        Map<String, Object> map = mapper.readValue(jsonData, Map.class);
+        for (Map.Entry<String, Object> entry : map.entrySet())
+        {
+          userAttributes.put(entry.getKey(), String.valueOf(entry.getValue()));
+        }
+      }
+      catch (Exception e)
+      {
+        // JSON parsing failed, leave empty
+      }
+    }
+  }
+}
 
 /**
  * SCIM2 Dynamic Group Destination plugin for synchronizing dynamic group memberships.
@@ -76,12 +119,19 @@ public class DynamicGroupMemberDestination extends SyncDestination
 
   // Helper utilities
   private Scim2MemberHelper memberHelper;
+  private Scim2UserCreationHelper userCreationHelper;
 
   // Configuration parameters
+  private String baseUrl;
+  private String userBasePath;
   private String groupBasePath;
   private String userLookupAttribute;
   private int maxRetries;
   private int retryDelayMs;
+  
+  // SCIM attribute mappings for user creation
+  private String[] scimUserAttributes;
+  private Map<String, String> scimUserMappings;
 
   @Override
   public String getExtensionName()
@@ -199,6 +249,21 @@ public class DynamicGroupMemberDestination extends SyncDestination
     // Load retry and timeout configuration
     this.maxRetries = getConfigValueAsInt(null, "scim2.max.retries", 3);
     this.retryDelayMs = getConfigValueAsInt(null, "scim2.retry.delay.ms", 1000);
+    
+    // Load SCIM user attributes for user creation
+    if (configFileLoader != null)
+    {
+      this.scimUserAttributes = configFileLoader.getPropertyList("scim.user.attributes");
+      this.scimUserMappings = configFileLoader.getPropertyMap("scim.user.map.");
+      serverContext.debugInfo("Loaded " + 
+          (scimUserAttributes != null ? scimUserAttributes.length : 0) + 
+          " SCIM user attributes for user creation");
+    }
+    else
+    {
+      this.scimUserAttributes = null;
+      this.scimUserMappings = new LinkedHashMap<String, String>();
+    }
 
     // Validate required configuration
     if (groupBasePath == null || groupBasePath.trim().isEmpty())
@@ -214,8 +279,9 @@ public class DynamicGroupMemberDestination extends SyncDestination
       this.scimService = clientFactory.createScimService();
       this.jaxrsClient = clientFactory.createJaxrsClient();
 
-      // Get user base path for member helper
-      String userBasePath = getConfigValue(null, "scim2.user.base", "/Users");
+      // Get base URL and user base path for member helper and user creation
+      this.baseUrl = getConfigValue(null, "scim2.base.url", "");
+      this.userBasePath = getConfigValue(null, "scim2.user.base", "/Users");
 
       // Initialize member helper
       this.memberHelper = new Scim2MemberHelper(
@@ -224,9 +290,14 @@ public class DynamicGroupMemberDestination extends SyncDestination
           groupBasePath,
           maxRetries,
           retryDelayMs);
+      
+      // Initialize user creation helper
+      this.userCreationHelper = new Scim2UserCreationHelper(scimService, userBasePath);
 
       // Log successful initialization
       serverContext.debugInfo("SCIM2 Dynamic Group Destination initialized successfully");
+      serverContext.debugInfo("  Base URL: " + baseUrl);
+      serverContext.debugInfo("  User Base: " + userBasePath);
       serverContext.debugInfo("  Group Base: " + groupBasePath);
       serverContext.debugInfo("  User Lookup Attribute: " + userLookupAttribute);
       serverContext.debugInfo("  Max Retries: " + maxRetries);
@@ -371,35 +442,68 @@ public class DynamicGroupMemberDestination extends SyncDestination
     operation.logInfo("Processing modifications for group: " + groupName +
                      " (ID: " + scim2GroupId + ")");
 
-    // Find members modification (dynamic groups only provide members attribute from source plugin)
-    Modification membersModification = null;
+    // Find memberMappings modification (enhanced format from source plugin)
+    Modification memberMappingsModification = null;
     
     for (Modification mod : modsToApply)
     {
       String attrName = mod.getAttributeName();
-      if ("members".equalsIgnoreCase(attrName))
+      if ("memberMappings".equalsIgnoreCase(attrName))
       {
-        membersModification = mod;
+        memberMappingsModification = mod;
         break;
       }
     }
 
-    if (membersModification == null)
+    if (memberMappingsModification == null)
     {
-      operation.logInfo("No members modification found, skipping");
+      operation.logInfo("No memberMappings modification found, skipping");
       return;
     }
 
-    ModificationType modType = membersModification.getModificationType();
-    String[] memberUserIds = membersModification.getValues();
+    ModificationType modType = memberMappingsModification.getModificationType();
+    String[] memberMappings = memberMappingsModification.getValues();
 
     operation.logInfo("Modification type: " + modType +
-                     ", member count: " + (memberUserIds != null ? memberUserIds.length : 0));
+                     ", member mapping count: " + (memberMappings != null ? memberMappings.length : 0));
 
     // Dynamic groups only support REPLACE (full resync)
     if (ModificationType.REPLACE.equals(modType))
     {
-      processGroupResync(scim2GroupId, groupName, memberUserIds, operation);
+      // Parse enhanced memberMappings format: userId::operationType::DN::{"attrs"}
+      List<DynamicMemberMappingData> mappingDataList = new ArrayList<>();
+      
+      if (memberMappings != null)
+      {
+        for (String mapping : memberMappings)
+        {
+          if (mapping == null || mapping.trim().isEmpty())
+          {
+            continue;
+          }
+          
+          // Parse format: userId::operationType::DN::{"scimAttr":"value",...}
+          String[] parts = mapping.split("::", 4);
+          
+          if (parts.length >= 3)
+          {
+            String userId = parts[0];
+            String operationType = parts[1];
+            String dn = parts[2];
+            String jsonData = (parts.length >= 4) ? parts[3] : null;
+            
+            DynamicMemberMappingData data = new DynamicMemberMappingData(userId, operationType, dn, jsonData);
+            mappingDataList.add(data);
+          }
+          else
+          {
+            operation.logInfo("WARNING: Invalid member mapping format: " + mapping);
+          }
+        }
+      }
+      
+      // Process with enhanced user creation support
+      processGroupResyncEnhanced(scim2GroupId, groupName, mappingDataList, operation);
     }
     else
     {
@@ -498,6 +602,68 @@ public class DynamicGroupMemberDestination extends SyncDestination
   }
 
   /**
+   * Enhanced version of processGroupResync that creates users as needed.
+   * Parses memberMappings (enhanced format) and creates missing users before updating group.
+   */
+  private void processGroupResyncEnhanced(
+      final String scim2GroupId,
+      final String groupName,
+      final List<DynamicMemberMappingData> mappings,
+      final SyncOperation operation)
+      throws EndpointException
+  {
+    if (mappings == null || mappings.isEmpty())
+    {
+      operation.logInfo("No member mappings to process for resync");
+      // Update group with empty member list
+      processGroupResync(scim2GroupId, groupName, new String[0], operation);
+      return;
+    }
+
+    operation.logInfo("Processing enhanced resync for: " + groupName +
+                     " with " + mappings.size() + " member mappings");
+
+    // Convert to SCIM2 members, creating users as needed
+    List<String> validUserIds = new ArrayList<>();
+    
+    for (DynamicMemberMappingData mapping : mappings)
+    {
+      String userId = mapping.userId;
+      
+      // Try to resolve user
+      String scim2UserId = memberHelper.findScim2UserId(userId, operation);
+      
+      if (scim2UserId == null && mapping.userAttributes != null && !mapping.userAttributes.isEmpty())
+      {
+        // User not found, try to create it
+        operation.logInfo("User " + userId + " not found, attempting to create from JSON data");
+        
+        boolean created = userCreationHelper.createUserFromAttributes(userId, mapping.userAttributes, operation);
+        if (created)
+        {
+          // Retry resolution after creation
+          scim2UserId = memberHelper.findScim2UserId(userId, operation);
+        }
+      }
+      
+      if (scim2UserId != null)
+      {
+        validUserIds.add(userId);
+      }
+      else
+      {
+        operation.logInfo("WARNING: Skipping user " + userId + " - could not resolve or create");
+      }
+    }
+
+    operation.logInfo("Resyncing group with " + validUserIds.size() + " members");
+
+    // Use existing processGroupResync method
+    processGroupResync(scim2GroupId, groupName, 
+        validUserIds.toArray(new String[0]), operation);
+  }
+
+  /**
    * Creates a Scim2ClientFactory from configuration.
    */
   private Scim2ClientFactory createClientFactory()
@@ -542,24 +708,7 @@ public class DynamicGroupMemberDestination extends SyncDestination
    */
   private String getConfigValue(StringArgument arg, String configKey, String defaultValue)
   {
-    // Check inline argument first
-    if (arg != null && arg.isPresent())
-    {
-      return arg.getValue();
-    }
-    
-    // Check config file
-    if (configFileLoader != null && configKey != null)
-    {
-      String value = configFileLoader.getProperty(configKey);
-      if (value != null)
-      {
-        return value;
-      }
-    }
-    
-    // Return default
-    return defaultValue;
+    return configFileLoader.getValueWithFallback(arg, configKey, defaultValue);
   }
 
   /**
@@ -567,19 +716,17 @@ public class DynamicGroupMemberDestination extends SyncDestination
    */
   private int getConfigValueAsInt(StringArgument arg, String configKey, int defaultValue)
   {
-    String strValue = getConfigValue(arg, configKey, null);
-    if (strValue != null)
+    // Check argument first
+    if (arg != null && arg.isPresent())
     {
-      try
-      {
-        return Integer.parseInt(strValue);
-      }
-      catch (NumberFormatException e)
-      {
-        serverContext.debugInfo("Invalid integer value for " + configKey + ": " + strValue +
-                               ", using default: " + defaultValue);
+      try {
+        return Integer.parseInt(arg.getValue());
+      } catch (NumberFormatException e) {
+        serverContext.debugInfo("Invalid integer value for argument: " + arg.getValue());
       }
     }
-    return defaultValue;
+    
+    // Use ConfigFileLoader's getIntProperty
+    return configFileLoader != null ? configFileLoader.getIntProperty(configKey, defaultValue) : defaultValue;
   }
 }
