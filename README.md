@@ -27,7 +27,11 @@ A production-ready Ping Data Sync extension for synchronizing LDAP group members
 This extension provides two complementary plugins for Ping Data Sync:
 
 1. **Scim2GroupMemberDestination** - Synchronizes group membership changes from LDAP to SCIM2 endpoints
-2. **LDAPSyncSourcePluginScim2GroupMembers** - Expands dynamic LDAP groups for resync operations
+2. **DynamicGroupSourcePlugin** - Handles dynamic group resync operations with early filtering
+3. **StaticGroupSourcePlugin** - Handles static group member operations with early filtering
+4. **UserBasicCrudSourcePlugin** - Filters user CRUD events based on group membership
+5. **UserGroupMembershipSourcePlugin** - Filters user group membership changes
+6. **GroupBasicCrudSourcePlugin** - Filters group CRUD events based on LDAP filter
 
 Together, these plugins enable comprehensive group membership synchronization between LDAP directories and SCIM2-compliant identity providers (IdPs) such as Okta, Azure AD, OneLogin, and others.
 
@@ -290,26 +294,15 @@ bin/dsconfig set-sync-pipe-prop \
 
 ### Source Plugin Configuration
 
-#### LDAPSyncSourcePluginScim2GroupMembers
+The project uses a multi-pipe architecture with specialized source plugins. See [SYNC_PIPE_ARCHITECTURE.md](SYNC_PIPE_ARCHITECTURE.md) for detailed configuration of each plugin:
 
-This plugin is **only required for group resync operations** with dynamic groups.
+- **DynamicGroupSourcePlugin** - For Groups-Dynamic-Resync pipe
+- **StaticGroupSourcePlugin** - For Groups-Static-Members pipe  
+- **UserBasicCrudSourcePlugin** - For Users-Basic-CRUD pipe
+- **UserGroupMembershipSourcePlugin** - For Users-Group-Membership pipe
+- **GroupBasicCrudSourcePlugin** - For Groups-Basic-CRUD pipe
 
-##### Required Parameters
-
-| Parameter | Type | Description | Example |
-|-----------|------|-------------|---------|
-| `user-id-attribute` | String | LDAP attribute on users for unique ID | `uid`, `employeeNumber` |
-
-##### Configuration Example
-
-```bash
-dsconfig create-ldap-sync-source-plugin \
-  --plugin-name "SCIM2GroupMemberSourcePlugin" \
-  --type ldap-sync-source-plugin-scim2-group-members \
-  --set enabled:true \
-  --set user-id-attribute:uid \
-  --pipe-name "YourSyncPipe"
-```
+Each source plugin performs upstream filtering to prevent unnecessary SCIM2 API queries.
 
 ## Operating Modes
 
@@ -348,7 +341,7 @@ dsconfig create-sync-pipe \
 
 **Configuration**:
 - Sync Mode: **Standard** with `--useExistingEntry` on resync
-- Source Plugin: **LDAPSyncSourcePluginScim2GroupMembers** (required)
+- Source Plugins: See multi-pipe architecture in [SYNC_PIPE_ARCHITECTURE.md](SYNC_PIPE_ARCHITECTURE.md)
 - Destination Plugin: Scim2GroupMemberDestination
 
 **Prerequisites**:
