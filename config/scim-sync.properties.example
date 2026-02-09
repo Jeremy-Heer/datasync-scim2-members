@@ -291,6 +291,30 @@ group.membership.attributes=scim-groups
 # scim2.allow.untrusted.certificates=false
 
 # ==============================================================================
+# ORPHAN CLEANUP CONFIGURATION
+# ==============================================================================
+
+# Resource type for orphan cleanup operations: user or group
+# Used by Scim2OrphanCleanupPlugin to determine which type of resources to delete
+# This should match the resource type of the associated orphan check source plugin
+# REQUIRED (for orphan cleanup pipes)
+# cleanup.resource.type=user
+
+# Page size for SCIM2 queries during orphan detection resync
+# Number of resources to fetch per page from SCIM2 when enumerating all entries
+# Larger values = fewer API calls but more memory usage
+# Default: 100
+# OPTIONAL
+# cleanup.page.size=100
+
+# Base DN for LDAP lookup during orphan detection
+# Used by orphan check source plugins to construct synthetic LDAP entries
+# Should match the base DN in your LDAP destination configuration
+# Example: ou=Users,dc=example,dc=com or ou=Groups,dc=example,dc=com
+# REQUIRED (for orphan check source plugins)
+# ldap.base.dn=ou=Users,dc=example,dc=com
+
+# ==============================================================================
 # LOGGING AND DEBUGGING
 # ==============================================================================
 

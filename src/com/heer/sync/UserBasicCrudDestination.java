@@ -31,6 +31,7 @@ import com.unboundid.scim2.common.types.UserResource;
 import com.heer.sync.lib.ConfigFileLoader;
 import com.heer.sync.lib.scim2.Scim2ClientFactory;
 import com.heer.sync.lib.scim2.Scim2MemberHelper;
+import com.heer.sync.lib.scim2.Scim2UserCreationHelper;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -92,6 +93,7 @@ public class UserBasicCrudDestination extends SyncDestination
   
   // Helper utilities
   private Scim2MemberHelper memberHelper;
+  private Scim2UserCreationHelper userCreationHelper;
   
   // SCIM attribute mappings
   private String[] scimUserAttributes;
@@ -277,8 +279,9 @@ public class UserBasicCrudDestination extends SyncDestination
       scimService = clientFactory.createScimService();
       jaxrsClient = clientFactory.createJaxrsClient();
       
-      // Initialize helper
+      // Initialize helpers
       memberHelper = new Scim2MemberHelper(scimService, userBasePath, groupBasePath, maxRetries, (int)retryDelayMs);
+      userCreationHelper = new Scim2UserCreationHelper(scimService, userBasePath);
       
       serverContext.debugInfo("Initialized SCIM2 User Basic CRUD Destination:");
       serverContext.debugInfo("  Base URL: " + baseUrl);
@@ -468,7 +471,7 @@ public class UserBasicCrudDestination extends SyncDestination
         
         if (scimAttr != null && mod.getValues() != null && mod.getValues().length > 0) {
           String newValue = mod.getValues()[0];
-          setScimAttributeValue(user, scimAttr, newValue);
+          userCreationHelper.setScimAttributeValue(user, scimAttr, newValue, operation);
           modified = true;
           operation.logInfo("Updated " + scimAttr + " = " + newValue);
         }
@@ -669,13 +672,13 @@ public class UserBasicCrudDestination extends SyncDestination
       user.setUserName(username);
     }
     
-    // Map other attributes
+    // Map other attributes using helper
     for (String scimAttr : scimUserAttributes) {
       String ldapAttr = scimUserMappings.get(scimAttr);
       if (ldapAttr != null) {
         String value = entry.getAttributeValue(ldapAttr);
         if (value != null) {
-          setScimAttributeValue(user, scimAttr, value);
+          userCreationHelper.setScimAttributeValue(user, scimAttr, value, operation);
         }
       }
     }
@@ -708,33 +711,5 @@ public class UserBasicCrudDestination extends SyncDestination
       }
     }
     return null;
-  }
-  
-  /**
-   * Sets SCIM attribute value on UserResource.
-   */
-  private void setScimAttributeValue(final UserResource user, final String scimAttr, final String value)
-  {
-    if ("userName".equals(scimAttr)) {
-      user.setUserName(value);
-    } else if ("displayName".equals(scimAttr)) {
-      user.setDisplayName(value);
-    } else if (scimAttr.startsWith("name.")) {
-      Name name = user.getName();
-      if (name == null) {
-        name = new Name();
-        user.setName(name);
-      }
-      String subAttr = scimAttr.substring(5);
-      if ("formatted".equals(subAttr)) name.setFormatted(value);
-      if ("familyName".equals(subAttr)) name.setFamilyName(value);
-      if ("givenName".equals(subAttr)) name.setGivenName(value);
-      if ("middleName".equals(subAttr)) name.setMiddleName(value);
-    } else if (scimAttr.startsWith("emails.")) {
-      Email email = new Email();
-      email.setValue(value);
-      email.setPrimary(true);
-      user.setEmails(Arrays.asList(email));
-    }
   }
 }
